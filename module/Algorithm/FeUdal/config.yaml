@@ -1,0 +1,32 @@
+# # worker, manager 通用
+gamma: 0.99           # worker, manager 通用折扣
+c_steps: 10            # 每幾步更新一次 manager / worker
+
+# manager 
+manager_hidden_dim: 256
+# goal_dim: local_state_dim
+# state_dim_d: local_state_dim 
+beta: 1            # manager value loss 權重
+manager_lr: 0.0005
+lambda_aux: 0.5
+
+# worker 
+worker_hidden_dim: 256  # 太小的話再擴增看看
+lambda: 0.95          # worker 用 GAE 的 λ
+alpha: 0.5  # 0.5            # r_w = alpha * r_int + eta * r_ext
+eta: 0.5    # 0.5            # r_w = alpha * r_int + eta * r_ext
+entropy_coef: 0.01    # worker entropy 權重
+worker_lr: 0.0005
+
+# COMA centralized critic
+coma_hidden_dim: 256
+coma_critic_lr: 0.0005
+coma_critic_coef: 1.0
+coma_aux_value_coef: 0.5
+
+# 其他欄位
+iterations: 1
+enable_mixer: False
+enable_double_q: False
+enable_on_policy: True
+enable_log_state_action: False

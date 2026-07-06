@@ -1,0 +1,37 @@
+# SMAC 訓練設定。修改後直接執行 run_train.ps1，不需要輸入其他參數。
+
+# 8m = 8 個 Marines 對 8 個 Marines
+map: 8m
+
+# 總環境步數；達到後會在當前回合結束時停止
+total_steps: 1600000
+
+# 隨機種子
+seed: 1
+
+# 電腦對手難度（1～10）
+difficulty: 7
+
+# SC2 每個 agent action 前進的遊戲 frame 數
+step_mul: 8
+
+# 勝率移動平均視窗
+win_rate_window: 100
+
+# 每幾回合更新一次 PNG 圖表
+plot_every: 25
+
+# 圖表指數移動平滑係數（越接近 1 越平滑）
+chart_smoothing: 0.99
+
+# 每幾回合儲存一次模型
+checkpoint_every: 100
+
+# 是否在訓練結束後儲存 replay
+save_replay: false
+
+# 留空表示用執行時間建立新的 runs 資料夾
+run_dir:
+
+# 要接續訓練時填入 checkpoint 完整路徑；新訓練請留空
+resume_checkpoint:

@@ -1,0 +1,8 @@
+.venv-smac/
+vendor/
+runs/
+__pycache__/
+*.py[cod]
+*.log
+.idea/
+.vscode/
