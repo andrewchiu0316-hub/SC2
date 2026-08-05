@@ -1,16 +1,26 @@
 # SMAC 訓練設定。修改後直接執行 run_train.ps1，不需要輸入其他參數。
 
 # 8m = 8 個 Marines 對 8 個 Marines
-map: 8m
+map: 3s5z
+
+# Algorithms: feudal, feudal_test, feudal_haa2c, haa2c, qmix.
+algorithm: feudal_haa2c
 
 # 總環境步數；達到後會在當前回合結束時停止
-total_steps: 1600000
+total_steps: 10000000
 
 # 隨機種子
 seed: 1
 
 # 電腦對手難度（1～10）
 difficulty: 7
+
+# Use 8 parallel environments on this Windows machine to avoid SC2 startup failures.
+n_rollout_threads: 8
+rollout_steps: 200
+
+# Launch only this many new SC2 instances at once; all 20 step in parallel afterwards.
+sc2_startup_batch_size: 2
 
 # SC2 每個 agent action 前進的遊戲 frame 數
 step_mul: 8

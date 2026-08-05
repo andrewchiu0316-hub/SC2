@@ -28,7 +28,7 @@ Windows 必須先透過 Battle.net 安裝 StarCraft II；免費 Starter Edition 
 在 PowerShell 執行：
 
 ```powershell
-cd C:\Users\P\Desktop\SC2\scripts\smac_feudal
+C:\Users\andre\Desktop\SC2-git\scripts\smac_feudal
 .\setup_smac.ps1
 ```
 

@@ -13,7 +13,7 @@ from matplotlib.figure import Figure
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-RUNS_ROOT = PROJECT_ROOT / "runs"
+RUNS_ROOT = Path("E:/SC2-runs") if Path("E:/SC2-runs").exists() else PROJECT_ROOT / "runs"
 
 
 def read_rows(run_dir: Path) -> list[dict[str, float]]:

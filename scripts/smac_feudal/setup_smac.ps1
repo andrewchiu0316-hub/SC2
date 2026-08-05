@@ -22,12 +22,17 @@ if (-not (Test-Path $SMACSource)) {
 
 if (-not $SkipPythonInstall) {
     if (-not (Test-Path $Python)) {
-        py -3.12 -m venv --system-site-packages $Venv
+        $PythonLauncher = Get-Command py -ErrorAction SilentlyContinue
+        if ($PythonLauncher) {
+            py -3.12 -m venv --system-site-packages $Venv
+        } else {
+            python -m venv --system-site-packages $Venv
+        }
     }
     & $Python -m pip install --upgrade pip
+    & $Python -m pip install torch numpy pyyaml matplotlib
     & $Python -m pip install -e $PySC2Source
     & $Python -m pip install -e $SMACSource
-    & $Python -m pip install matplotlib
 }
 
 if (-not $SC2Path) {
@@ -35,7 +40,9 @@ if (-not $SC2Path) {
         ${env:SC2PATH},
         "C:\Program Files (x86)\StarCraft II",
         "C:\Program Files\StarCraft II"
-    ) | Where-Object { $_ -and (Test-Path $_) }
+    ) | Where-Object {
+        $_ -and (Test-Path $_) -and (Test-Path (Join-Path $_ "Versions"))
+    }
     $SC2Path = $Candidates | Select-Object -First 1
 }
 

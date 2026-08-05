@@ -1,0 +1,30 @@
+# FeUdal hierarchy with HARL HAA2C-style sequential actor updates.
+gamma: 0.99
+gae_lambda: 0.95
+manager_c_steps: 50
+worker_update_steps: 200
+
+# FeUdal manager. Worker GAE uses the environment reward directly.
+manager_hidden_dim: 256
+manager_learning_rate: 0.0005
+manager_advantage_clip: 15.0
+manager_value_loss_coef: 1.0
+
+# Independent heterogeneous worker actors.
+worker_hidden_dim: 256
+actor_learning_rate: 0.0005
+a2c_epoch: 5
+entropy_coef: 0.01
+fixed_order: false
+
+# Centralized HAA2C critic.
+critic_hidden_dim: 128
+critic_learning_rate: 0.0005
+critic_epoch: 5
+value_loss_coef: 1.0
+use_clipped_value_loss: true
+value_clip: 0.2
+huber_delta: 10.0
+
+optimizer_eps: 0.00001
+max_grad_norm: 10.0

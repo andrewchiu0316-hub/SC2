@@ -1,0 +1,22 @@
+# HARL HAA2C defaults. The runner collects rollout_steps from every environment.
+gamma: 0.99
+gae_lambda: 0.95
+rollout_steps: 200
+
+hidden_dim: 128
+actor_learning_rate: 0.0005
+critic_learning_rate: 0.0005
+optimizer_eps: 0.00001
+
+a2c_epoch: 5
+critic_epoch: 5
+entropy_coef: 0.01
+value_loss_coef: 1.0
+use_clipped_value_loss: true
+value_clip: 0.2
+huber_delta: 10.0
+max_grad_norm: 10.0
+fixed_order: false
+
+use_value_norm: true
+value_norm_beta: 0.99999

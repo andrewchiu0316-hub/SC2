@@ -1,4 +1,4 @@
-from module.Algorithm.FeUdal.model.model import RLIR_ManagerAgent, RLIR_WorkerAgent
+from module.Algorithm.FeUdal_test.model.model import RLIR_ManagerAgent, RLIR_WorkerAgent
 from module.Algorithm.base_algorithm import BaseAlgorithm
 
 import torch
@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from Tools import utils
 from types import SimpleNamespace
 import os
-import numpy as np   
+import numpy as np
 #from Tools.pcgrad import PCGrad
 
 # 給module是fc的演算法(worker只有單個rnn)
@@ -52,6 +52,10 @@ class Algorithm(BaseAlgorithm):
         self.eta_ext      = self.cfg["eta"]            # 外在獎勵權重
         self.beta_mgr_v   = self.cfg["beta"]           # manager value loss 權重
         self.entropy_coef = self.cfg["entropy_coef"]
+        self.reward_scale = float(self.cfg.get("reward_scale", 1.0))
+        self.manager_advantage_clip = float(
+            self.cfg.get("manager_advantage_clip", 15.0)
+        )
         # [NEW] Task head entropy（讓 task policy 不會太早塌縮）
         self.task_entropy_coef = self.cfg.get("task_entropy_coef", 0.01)
         # goal_dim / state_dim_d 將在下方綁定為 latent space 維度
@@ -128,7 +132,6 @@ class Algorithm(BaseAlgorithm):
         self.last_loss_worker  = 0.0
         self.last_loss_manager = 0.0
         # [新增] 全域獎勵放大倍率，確保 Actor 與 Critic 權重平衡
-        self.reward_scale = 100.0
         # ================= [新增] 詳細 Loss 紀錄變數 =================
         self.last_worker_policy_loss = 0.0
         self.last_worker_value_loss  = 0.0
@@ -141,21 +144,21 @@ class Algorithm(BaseAlgorithm):
         self.last_per_agent_reward = [0.0] * self.n_agents
         self.just_updated = False
         # -----------------------------------------------------
-        
+
         # [NEW] 新增：詳細數值監控變數
         self.last_manager_cos_sim    = 0.0  # Cosine Similarity
         self.last_manager_advantage  = 0.0  # Advantage (A_mgr)
         self.last_manager_return     = 0.0  # Manager 的 R_ext
         self.last_manager_value_pred = 0.0  # [新增] Manager 的 V_m (Prediction)
         self.last_worker_mean_reward = 0.0  # Worker 的平均混合獎勵
-        
+
         # [新增] per-agent loss（保留 agent 維度，沿時間維度平均）
         self.last_per_agent_policy_loss = [0.0] * self.n_agents
         self.last_per_agent_value_loss  = [0.0] * self.n_agents
         self.last_per_agent_cos_sim     = [0.0] * self.n_agents
         # ===========================================================
 
-    
+
 
     # ----------------- buffer helper -----------------
     def _store_step(self, s_l, s_g, goal, task_idx, action, logp_w, v_w, r_ext_m, r_ext_w, r_int, done, alive_mask, avail_actions=None):
@@ -181,7 +184,7 @@ class Algorithm(BaseAlgorithm):
 
     # ----------------- Worker / Manager update -----------------
     #  next_alive_mask 參數 (預設給 None 確保相容性)
-    def train(self, next_global_state=None, next_alive_mask=None):
+    def train(self, next_global_state=None, next_local_state=None, next_alive_mask=None):
         """
         用 seg_buffer 的一段資料做一次 manager + worker 更新。
         next_global_state: 用於計算 Bootstrap value (當 done=False 時)
@@ -201,7 +204,7 @@ class Algorithm(BaseAlgorithm):
         goal = torch.stack([step["goal"] for step in self.seg_buffer], dim=0).to(device) # [L,A,Dl]
         task_idx_seq = torch.stack([step["task_idx"] for step in self.seg_buffer], dim=0).to(device)  # [L,A] 或 [L]
         a = torch.stack([step["a"] for step in self.seg_buffer], dim=0).to(device)       # [L,A]
-        
+
         # [新增] 讀取存在 buffer 裡的 r_int
         r_int = torch.stack([step["r_int"] for step in self.seg_buffer], dim=0).to(device)  # [L,A]
 
@@ -231,8 +234,10 @@ class Algorithm(BaseAlgorithm):
         # =========================================================
         h0_w = self.segment_start_worker_hidden
         task_idx_seq_worker = task_idx_seq.view(L, 1, A)
-        
-        logits_seq, v_w_seq, _ = self.worker(s_l_seq, h0_w, goal_seq, task_indices=task_idx_seq_worker)
+
+        logits_seq, v_w_seq, h_w_end = self.worker(
+            s_l_seq, h0_w, goal_seq, task_indices=task_idx_seq_worker
+        )
 
         logits = logits_seq[:, 0]  # [L,A,n_actions]
         v_w = v_w_seq[:, 0]        # [L,A]
@@ -243,10 +248,10 @@ class Algorithm(BaseAlgorithm):
 
         dist_w = torch.distributions.Categorical(logits=logits)
         logp_w = dist_w.log_prob(a.long())   # [L, A]
-        
+
         # ====== Worker Reward：使用 Worker 專屬外在獎勵 ======
         r_w = self.alpha_int * r_int + self.eta_ext * r_ext_w    # [L, A]
-        
+
         # ----------------- Worker GAE -----------------
         with torch.no_grad():
             # 取得「下一步是否存活」的遮罩 (Dead Agent 的未來價值必須為 0)
@@ -263,33 +268,47 @@ class Algorithm(BaseAlgorithm):
             # bootstrap：把下一步 value 視為 shift 一格
             v_w_next = torch.zeros_like(v_w)
             v_w_next[:-1] = v_w[1:]
-            
+
             # 避免截斷誤差。如果遊戲還沒結束，最後一步的 V 不能是 0
-            v_w_next[-1] = torch.where(done[-1] > 0.5, torch.zeros_like(v_w[-1]), v_w[-1])
-            
+            v_w_next[-1] = torch.zeros_like(v_w[-1])
+            if done[-1] <= 0.5 and next_local_state is not None:
+                next_local = torch.as_tensor(
+                    next_local_state, dtype=s_l.dtype, device=device
+                ).reshape(1, 1, A, Dl)
+                next_goal = goal[-1].reshape(1, 1, A, -1)
+                next_task = task_idx_seq[-1].reshape(1, 1, A)
+                detached_hidden = tuple(part.detach() for part in h_w_end)
+                _, next_values, _ = self.worker(
+                    next_local,
+                    detached_hidden,
+                    next_goal,
+                    task_indices=next_task,
+                )
+                v_w_next[-1] = next_values[0, 0]
+
             # 死亡截斷。如果下一步該 agent 死了，未來的 Bootstrap 必須強制作廢 (乘上 0)
             v_w_next_masked = v_w_next * alive_next
 
             # 計算 TD Error (使用 v_w_next_masked)
             delta = r_w + self.gamma * (1.0 - done.view(L, 1)) * v_w_next_masked - v_w   # [L,A]
-        
+
             adv = torch.zeros_like(delta)
             gae = torch.zeros(A, device=device)
             for t in reversed(range(L)):
                 # GAE 不能從「已經死亡的未來狀態」回傳回來
                 # next_alive 決定了這條船在 t+1 是否還活著，死了就截斷未來的 GAE 傳遞
                 next_alive = alive[t+1] if t < L - 1 else alive[-1]
-                
+
                 # 同時受到全局 done 與 個體 next_alive 的截斷
                 gae = delta[t] + self.gamma * self.lam * (1.0 - done[t]) * next_alive * gae
                 adv[t] = gae
-        
+
             R_w = adv + v_w
-        
+
         # ----------------- Worker Loss (for logging) -----------------
         # mask 死掉的船
         valid_mask = alive  # [L,A]
-        
+
         total_denom = valid_mask.sum().clamp(min=1.0)
         agent_denom = valid_mask.sum(dim=0).clamp(min=1.0)  # [A]
 
@@ -299,14 +318,14 @@ class Algorithm(BaseAlgorithm):
         adv_mean = adv_masked.sum() / total_denom
         adv_std = torch.sqrt((((adv_det - adv_mean) * valid_mask) ** 2).sum() / total_denom + 1e-8)
         adv_norm = ((adv_det - adv_mean) / adv_std) * valid_mask
-        
+
         # actor：改用 adv_norm 來計算 Policy Loss
         term = - (adv_norm * logp_w).sum(dim=0) / agent_denom  # [A]
         per_agent_policy_loss = torch.nan_to_num(term, nan=0.0)
-        
+
         # 2. 計算個別 Agent 的 Value Loss（沿時間維度平均，保留 agent 維度）
         #per_agent_value_loss  = ((R_w.detach() - v_w)**2 * valid_mask).sum(dim=0) / agent_denom  # [A]
-        
+
         # 3. 計算原本的總 Loss (用來做 backward)
         # 為了保持跟原本數學定義一致，這裡還是用總合除以總步數
         worker_policy_loss = - (adv_norm * logp_w).sum() / total_denom
@@ -326,8 +345,12 @@ class Algorithm(BaseAlgorithm):
         per_agent_entropy = (entropy * valid_mask).sum(dim=0) / agent_denom  # [A]
         # =================================================================
         #worker_loss = worker_policy_loss + worker_value_loss - self.entropy_coef * worker_entropy
-        worker_loss = (worker_policy_loss * self.reward_scale) + worker_value_loss - (self.entropy_coef * worker_entropy * self.reward_scale)
-        
+        worker_loss = (
+            worker_policy_loss
+            + worker_value_loss
+            - self.entropy_coef * worker_entropy
+        )
+
 
         # ================== 2. Manager: anchor-only 版本 (修正版, Global Goal + Task Head) ==================
         # 這段 segment 只有在 t=0 時 Manager 做了一次決策（產生 goal）
@@ -347,7 +370,7 @@ class Algorithm(BaseAlgorithm):
         # - 若 Manager 輸出為 [1,1,1,Dg]：goals_seq[0,0] => [1,Dg]，reshape(-1) => [Dg]
         global_goal_with_grad = goals_seq[0, 0].reshape(-1)
 
-        
+
         v_m_start = v_m_seq[0, 0]
 
         # ---- (1) 外在 n-step return ----
@@ -400,12 +423,16 @@ class Algorithm(BaseAlgorithm):
 
         # Advantage（只針對 t=0 的決策）
         A_mgr = R_ext - v_m_start
-        
+
         # [修改重點 1]：將 Manager 的 Advantage 進行截斷，防止梯度爆炸
         # 由於此處 batch=1 無法做正規化，使用 clamp 限制影響力
         #A_mgr_clipped = torch.clamp(A_mgr, min=-15.0, max=15.0).detach()
         # 因為前面獎勵放大了 100 倍，這裡的容忍範圍也要等比例放大到 1500
-        A_mgr_clipped = torch.clamp(A_mgr, min=-1500.0, max=1500.0).detach()
+        A_mgr_clipped = torch.clamp(
+            A_mgr,
+            min=-self.manager_advantage_clip,
+            max=self.manager_advantage_clip,
+        ).detach()
         # [新增] 取得 t=0 的存活遮罩，Manager 不該對死掉的 Agent 更新策略
         valid_agents_t0 = alive[0]  # [A]
         denom_t0 = valid_agents_t0.sum().clamp(min=1.0)
@@ -413,8 +440,9 @@ class Algorithm(BaseAlgorithm):
         # ---- (2) Goal Loss：Cosine Similarity ----
         # 使用 Worker 的 state_encoder 將起終點 State 轉換到 Latent Space
         with torch.no_grad():
-            z_start = self.worker.state_encoder(s_l[0])   # [A, latent_dim]
-            z_end = self.worker.state_encoder(s_l[-1])    # [A, latent_dim]
+            segment_goal = goal[0]
+            z_start = self.worker.encode_state_goal(s_l[0], segment_goal)
+            z_end = self.worker.encode_state_goal(s_l[-1], segment_goal)
 
         delta_mgr_agents = z_end - z_start                     # [A, latent_dim]
         goal_agents = global_goal_with_grad.view(A, d)         # [A, latent_dim]
@@ -423,21 +451,21 @@ class Algorithm(BaseAlgorithm):
         goal_norm_grad = F.normalize(goal_agents, dim=-1, eps=1e-8)
 
         cos_sim_per_agent = (delta_norm.detach() * goal_norm_grad).sum(dim=-1)  # [A]
-        
+
         # 只計算活著的 Agent 的平均 Cosine Similarity
         cos_sim = (cos_sim_per_agent * valid_agents_t0).sum() / denom_t0
 
         # 圖中公式：- Sum [ A_t * cos(...) ]
         loss_goal = - A_mgr_clipped * cos_sim
 
-        
+
 
         # ---- (4) Value Loss ----
         #manager_value_loss  = (R_ext.detach() - v_m_start) ** 2
         #loss_value = self.beta_mgr_v * manager_value_loss
         # 新的寫法 (Smooth L1 Loss)：
         manager_value_loss = F.smooth_l1_loss(v_m_start, R_ext.detach(), beta=1.0)
-        
+
         loss_value = self.beta_mgr_v * manager_value_loss
 
         manager_loss = loss_goal  + loss_value
@@ -445,7 +473,7 @@ class Algorithm(BaseAlgorithm):
         # ================== 3. 反向傳遞 ==================
         # 確保每次更新前清空 Worker 梯度
         self.worker_opt.zero_grad()
-        
+
         # =========================================================
         # [修改] 單一 Head 直接反向傳遞 worker_loss
         # =========================================================
@@ -467,7 +495,7 @@ class Algorithm(BaseAlgorithm):
         # ================= [新增] 儲存詳細 Loss =================
         self.last_worker_policy_loss = float(worker_policy_loss.item())
         self.last_worker_value_loss  = float(worker_value_loss.item())
-        
+
         # [新增] 將 Tensor [A] 轉成 list[float] 存起來，給 Workspace 用
         self.last_per_agent_policy_loss = per_agent_policy_loss.detach().cpu().tolist()
         self.last_per_agent_value_loss  = per_agent_value_loss.detach().cpu().tolist()
@@ -478,11 +506,11 @@ class Algorithm(BaseAlgorithm):
         # -------- [修改] 拆分 Manager 的 Policy(Goal) 與 Task Loss --------
         self.last_manager_goal_loss = float(loss_goal.item())
         self.last_manager_task_loss = 0.0
-        
+
         # policy loss 現在包含：goal + task
         self.last_manager_policy_loss = float(loss_goal.item())
         self.last_manager_value_loss  = float(manager_value_loss.item())
-        
+
         # [NEW] 新增：儲存您要求的詳細分析指標
         self.last_manager_cos_sim    = float(cos_sim.item())      # 餘弦相似度 (scalar)
         self.last_manager_advantage  = float(A_mgr.item())        # Advantage (scalar)
@@ -531,14 +559,13 @@ class Algorithm(BaseAlgorithm):
         # -------- [新增] 每次進來先歸零標記 --------
         self.just_updated = False
         # [新增] 全域獎勵放大倍率，確保 Actor 與 Critic 權重平衡
-        self.reward_scale = 100.0
         # 轉成 tensor
         # local_state 現在是 list[np.ndarray]，先堆成一個 np.ndarray 再轉 torch
         if isinstance(local_state, np.ndarray):
             local_state_arr = local_state.astype(np.float32, copy=False)
         else:
             local_state_arr = np.asarray(local_state, dtype=np.float32)  # [A, Dl]
-        
+
         s_l = torch.from_numpy(local_state_arr).to(device=device)        # [A,Dl]
         s_g = torch.as_tensor(global_state, dtype=torch.float32, device=device)   # [Dg]
         alive = torch.as_tensor(alive_mask, dtype=torch.float32, device=device)   # [A]
@@ -559,7 +586,7 @@ class Algorithm(BaseAlgorithm):
                 r_ext_w_tensor = torch.tensor([float(reward_ext_w)] * A, dtype=torch.float32, device=device)
             """
             # (A) 外在獎勵：Manager / Worker 分流
-              
+
 
             if isinstance(reward_ext_m, (list, tuple)):
                 r_ext_m_tensor = torch.tensor(reward_ext_m, dtype=torch.float32, device=device) * self.reward_scale
@@ -570,15 +597,15 @@ class Algorithm(BaseAlgorithm):
                 r_ext_w_tensor = torch.tensor(reward_ext_w, dtype=torch.float32, device=device) * self.reward_scale
             else:
                 r_ext_w_tensor = torch.tensor([float(reward_ext_w)] * A, dtype=torch.float32, device=device) * self.reward_scale
-            
+
             # (B) 內在獎勵：r_int = cos( Z_{t+1} - Z_t, goal )
             # 透過 Worker 的 state_encoder 將 state 壓縮到 latent space
             with torch.no_grad():
-                z_curr = self.worker.state_encoder(cache["s_l"]) # [A, latent_dim]
-                z_next = self.worker.state_encoder(s_l)          # [A, latent_dim]
+                goal_curr = cache["goal"]
+                z_curr = self.worker.encode_state_goal(cache["s_l"], goal_curr)
+                z_next = self.worker.encode_state_goal(s_l, goal_curr)
 
             delta_z = z_next - z_curr  # [A, latent_dim]
-            goal_curr = cache["goal"]  # [A, latent_dim]
             eps = 1e-8
             d_norm = F.normalize(delta_z, dim=-1, eps=eps)
             g_norm = F.normalize(goal_curr, dim=-1, eps=eps)
@@ -613,7 +640,11 @@ class Algorithm(BaseAlgorithm):
                 # 如果 done=True，這個 next_global_state 其實不會被用到 (terminal_hit 會是 True)
                 # 如果 done=False，這個就是我們需要的 Bootstrap 依據
                 # 傳入 next_alive_mask 讓演算法精確判斷邊界生死
-                self.train(next_global_state=global_state, next_alive_mask=alive)
+                self.train(
+                    next_global_state=global_state,
+                    next_local_state=s_l,
+                    next_alive_mask=alive,
+                )
                 # -------- [新增] 標記這一步有成功進行訓練 --------
                 self.just_updated = True
 
@@ -633,7 +664,7 @@ class Algorithm(BaseAlgorithm):
             goal = goals_seq[0, 0]
             self.current_goal = goal
 
-            
+
         else:
             goal   = self.current_goal
             # [修正] 刪除 Manager 抽籤 (Categorical sample) 的邏輯
@@ -717,7 +748,7 @@ class Algorithm(BaseAlgorithm):
     def update_target_network(self):
         # Feudal RLIR 是 on-policy actor-critic，不用 target network
         return
-        
+
     # ----------------- save / load model -----------------
     def save_model(self, ckpt: dict):
         ckpt["manager"] = self.manager.state_dict()
