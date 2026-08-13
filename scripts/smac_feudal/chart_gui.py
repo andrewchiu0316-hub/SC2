@@ -10,6 +10,7 @@ from tkinter import messagebox, ttk
 
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
+from matplotlib import colormaps
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -167,7 +168,7 @@ class ChartApp:
             self.figure.clear()
             axes = self.figure.subplots(3, 2)
             plotted_runs: list[str] = []
-            colors = self.figure.get_cmap("tab10")
+            colors = colormaps["tab10"]
             for run_index, run_dir in enumerate(sorted(self.checked, key=lambda path: path.name)):
                 rows = read_rows(run_dir)
                 if not rows:
@@ -180,11 +181,14 @@ class ChartApp:
                 plotted_runs.append(run_dir.name)
                 for axis, (key, title) in zip(axes.flat, series):
                     values = [row[key] for row in rows]
-                    axis.plot(environment_steps, values, linewidth=0.7, alpha=0.12, color=color)
+                    # Keep noisy per-episode samples in the background so that
+                    # several runs can be compared without obscuring each other.
+                    axis.plot(environment_steps, values, linewidth=0.6, alpha=0.035, color=color)
                     axis.plot(
                         environment_steps,
                         smooth(values, smoothing),
                         linewidth=1.8,
+                        alpha=0.85,
                         color=color,
                         label=run_dir.name,
                     )
