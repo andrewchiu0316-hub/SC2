@@ -1,7 +1,7 @@
 # FeUdal hierarchy with HARL HAA2C-style sequential actor updates.
 gamma: 0.99
 gae_lambda: 0.95
-manager_c_steps: 50
+manager_c_steps: 10
 worker_update_steps: 200
 
 # FeUdal manager. Worker GAE uses the environment reward directly.

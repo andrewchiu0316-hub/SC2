@@ -333,6 +333,159 @@ def run_parallel_haa2c(args, run_dir: Path, Algorithm) -> None:
         envs.close()
 
 
+def run_parallel_independent(args, run_dir: Path, Algorithm) -> None:
+    """Run algorithms without a vectorized policy API in parallel SMAC processes.
+
+    Each replica owns its recurrent state, replay/rollout buffer and optimizer.  This
+    is deliberately different from ``run_parallel_haa2c``: sharing a single legacy
+    FeUdal or QMIX instance would interleave their recurrent hidden states and make
+    the resulting trajectories invalid.  Checkpoints are therefore written once per
+    replica under ``checkpoints/replica_<id>_*.pt``.
+    """
+    env_count = int(args.n_rollout_threads)
+    env_kwargs = [
+        {
+            "map_name": args.map,
+            "seed": args.seed + rank * 1000,
+            "difficulty": args.difficulty,
+            "step_mul": args.step_mul,
+            "reward_only_positive": True,
+            "reward_scale": True,
+            "reward_scale_rate": 20,
+        }
+        for rank in range(env_count)
+    ]
+    envs = SubprocSMACVecEnv(env_kwargs, startup_batch_size=args.sc2_startup_batch_size)
+    csv_file = None
+    try:
+        info = envs.get_env_info()
+        agents = [
+            Algorithm(
+                action_num=info["n_actions"],
+                n_agents=info["n_agents"],
+                state_dim=info["obs_shape"],
+                state_g_dim=info["state_shape"],
+                rollout_steps=args.rollout_steps,
+            )
+            for _ in range(env_count)
+        ]
+        episode = 0
+        env_steps = 0
+        if args.resume:
+            saved = torch.load(args.resume, map_location=agents[0].device, weights_only=False)
+            for agent in agents:
+                agent.load_model(saved)
+            episode = int(saved.get("episode", 0))
+            env_steps = int(saved.get("environment_steps", 0))
+
+        csv_path = run_dir / "metrics.csv"
+        rows: list[dict[str, float]] = []
+        wins: deque[int] = deque(maxlen=args.window)
+        best_win_rate = -1.0
+        csv_file = csv_path.open("a", newline="", encoding="utf-8")
+        csv_writer = csv.DictWriter(csv_file, fieldnames=METRIC_FIELDS)
+        if csv_path.stat().st_size == 0:
+            csv_writer.writeheader()
+
+        observations, global_states, available = envs.reset()
+        alive = available[:, :, 1:].any(axis=-1)
+        episode_returns = np.zeros(env_count, dtype=np.float64)
+        episode_lengths = np.zeros(env_count, dtype=np.int64)
+        actions = []
+        for env_id, agent in enumerate(agents):
+            agent.episode_reset()
+            action, _ = agent.sample_action(
+                observations[env_id], global_states[env_id], None, None, False,
+                alive[env_id], avail_actions=available[env_id],
+            )
+            actions.append(action)
+        actions = np.asarray(actions, dtype=np.int64)
+
+        print(
+            f"{args.algorithm} parallel replicas: {env_count} independent environments "
+            f"(one model/checkpoint per replica)"
+        )
+        while env_steps < args.total_steps:
+            rewards, dones, infos, next_observations, next_global_states, next_available = envs.step(actions)
+            next_alive = next_available[:, :, 1:].any(axis=-1)
+            env_steps += env_count
+            episode_returns += rewards
+            episode_lengths += 1
+            next_actions = np.zeros_like(actions)
+            done_indices = np.flatnonzero(dones).tolist()
+
+            for env_id, agent in enumerate(agents):
+                action, _ = agent.sample_action(
+                    next_observations[env_id], next_global_states[env_id],
+                    float(rewards[env_id]), [float(rewards[env_id])] * info["n_agents"],
+                    bool(dones[env_id]), next_alive[env_id], avail_actions=next_available[env_id],
+                )
+                next_actions[env_id] = action
+
+            for env_id in done_indices:
+                episode += 1
+                final_info = infos[env_id]
+                won = int(bool(final_info.get("battle_won", False)))
+                kills = int(final_info.get("dead_enemies", 0))
+                survivors = info["n_agents"] - int(final_info.get("dead_allies", 0))
+                wins.append(won)
+                rolling_win_rate = float(np.mean(wins))
+                row = {
+                    "episode": episode, "environment_steps": env_steps,
+                    "episode_steps": int(episode_lengths[env_id]),
+                    "return": float(episode_returns[env_id]), "allied_kills": kills,
+                    "allied_survivors": survivors, "won": won,
+                    "rolling_win_rate": rolling_win_rate,
+                }
+                rows.append(row)
+                csv_writer.writerow(row)
+                print(
+                    f"episode={episode:6d} replica={env_id:2d} return={row['return']:9.3f} "
+                    f"steps={row['episode_steps']:3d} total_steps={env_steps:9d}/{args.total_steps} "
+                    f"kills={kills:2d} survivors={survivors:2d} win_rate({args.window})={rolling_win_rate:.3f}"
+                )
+                if episode % args.plot_every == 0:
+                    plot_metrics(rows, run_dir / "training_metrics.png", args.window, args.smoothing)
+                if episode % args.checkpoint_every == 0:
+                    for replica_id, replica in enumerate(agents):
+                        checkpoint(replica, episode, env_steps, run_dir / "checkpoints" / f"replica_{replica_id}_episode_{episode}.pt")
+                if len(wins) == args.window and rolling_win_rate > best_win_rate:
+                    best_win_rate = rolling_win_rate
+                    for replica_id, replica in enumerate(agents):
+                        checkpoint(replica, episode, env_steps, run_dir / "checkpoints" / f"replica_{replica_id}_best_win_rate.pt", rolling_win_rate)
+                episode_returns[env_id] = 0.0
+                episode_lengths[env_id] = 0
+
+            if done_indices:
+                reset_snapshots = envs.reset_at(done_indices)
+                for env_id, snapshot in reset_snapshots.items():
+                    next_observations[env_id], next_global_states[env_id], next_available[env_id] = snapshot
+                    next_alive[env_id] = next_available[env_id, :, 1:].any(axis=-1)
+                    agents[env_id].episode_reset()
+                    action, _ = agents[env_id].sample_action(
+                        next_observations[env_id], next_global_states[env_id], None, None, False,
+                        next_alive[env_id], avail_actions=next_available[env_id],
+                    )
+                    next_actions[env_id] = action
+
+            observations, global_states, available, alive, actions = (
+                next_observations, next_global_states, next_available, next_alive, next_actions
+            )
+            csv_file.flush()
+
+        plot_metrics(rows, run_dir / "training_metrics.png", args.window, args.smoothing)
+        for replica_id, replica in enumerate(agents):
+            if hasattr(replica, "finalize_training"):
+                replica.finalize_training()
+            checkpoint(replica, episode, env_steps, run_dir / "checkpoints" / f"replica_{replica_id}_final.pt")
+        if args.save_replay:
+            envs.save_replay()
+    finally:
+        if csv_file is not None:
+            csv_file.close()
+        envs.close()
+
+
 def main() -> None:
     args = parse_args()
     np.random.seed(args.seed)
@@ -347,8 +500,11 @@ def main() -> None:
     )
 
     Algorithm = load_algorithm_class(args.algorithm)
-    if args.algorithm in {"haa2c", "feudal_haa2c"} and args.n_rollout_threads > 1:
-        run_parallel_haa2c(args, run_dir, Algorithm)
+    if args.n_rollout_threads > 1:
+        if args.algorithm in {"haa2c", "feudal_haa2c"}:
+            run_parallel_haa2c(args, run_dir, Algorithm)
+        else:
+            run_parallel_independent(args, run_dir, Algorithm)
         return
     env = StarCraft2Env(
         map_name=args.map,

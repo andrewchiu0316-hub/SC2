@@ -4,7 +4,7 @@
 map: 3s5z
 
 # Algorithms: feudal, feudal_test, feudal_haa2c, haa2c, qmix.
-algorithm: feudal_haa2c
+algorithm: haa2c
 
 # 總環境步數；達到後會在當前回合結束時停止
 total_steps: 10000000
@@ -16,7 +16,7 @@ seed: 1
 difficulty: 7
 
 # Use 8 parallel environments on this Windows machine to avoid SC2 startup failures.
-n_rollout_threads: 8
+n_rollout_threads: 10
 rollout_steps: 200
 
 # Launch only this many new SC2 instances at once; all 20 step in parallel afterwards.

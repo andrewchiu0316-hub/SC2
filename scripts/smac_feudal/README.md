@@ -5,7 +5,12 @@
 - `module/Algorithm/FeUdal/algorithm.py`
 - `module/Algorithm/FeUdal/model/model.py`
 
-環境採用官方 SMAC 地圖。每回合會記錄：
+環境採用官方 SMAC 地圖。`n_rollout_threads` 大於 1 時，所有演算法都會平行啟動多個 SMAC 環境：
+
+- `haa2c`、`feudal_haa2c` 使用一套共用權重做向量化 rollout。
+- `feudal`、`feudal_test`、`qmix` 使用獨立 replica，避免舊版 RNN／replay buffer 的狀態互相污染；各 replica 的模型會各自存到 `checkpoints/replica_<id>_*.pt`。
+
+每回合會記錄：
 
 - episode return
 - 每回合步數
@@ -28,7 +33,7 @@ Windows 必須先透過 Battle.net 安裝 StarCraft II；免費 Starter Edition 
 在 PowerShell 執行：
 
 ```powershell
-C:\Users\andre\Desktop\SC2-git\scripts\smac_feudal
+C:\Users\邱鵬\Desktop\SC2\scripts\smac_feudal
 .\setup_smac.ps1
 ```
 

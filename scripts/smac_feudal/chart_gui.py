@@ -57,7 +57,7 @@ class ChartApp:
         self.root.title("SC2 FeUdal 離線訓練圖表")
         self.root.geometry("1450x850")
         self.root.minsize(1050, 650)
-        self.checked: Path | None = None
+        self.checked: set[Path] = set()
 
         outer = ttk.Panedwindow(root, orient=tk.HORIZONTAL)
         outer.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
@@ -70,10 +70,10 @@ class ChartApp:
         ttk.Label(left, text="訓練紀錄", font=("Microsoft JhengHei UI", 14, "bold")).pack(
             anchor=tk.W, pady=(0, 8)
         )
-        ttk.Label(left, text="點擊第一欄勾選，再按「顯示圖表」").pack(anchor=tk.W, pady=(0, 8))
+        ttk.Label(left, text="點擊第一欄可勾選多筆，再按「顯示圖表」比較").pack(anchor=tk.W, pady=(0, 8))
 
         columns = ("checked", "time", "map", "episodes", "name")
-        self.table = ttk.Treeview(left, columns=columns, show="headings", selectmode="browse")
+        self.table = ttk.Treeview(left, columns=columns, show="headings", selectmode="extended")
         self.table.heading("checked", text="選擇")
         self.table.heading("time", text="執行時間")
         self.table.heading("map", text="地圖")
@@ -108,7 +108,7 @@ class ChartApp:
         self.show_selected()
 
     def refresh(self) -> None:
-        self.checked = None
+        self.checked.clear()
         for item in self.table.get_children():
             self.table.delete(item)
         if not RUNS_ROOT.exists():
@@ -135,77 +135,73 @@ class ChartApp:
             self.table.item(row_id, values=values)
             self.table.selection_set(row_id)
             self.table.focus(row_id)
-            self.checked = Path(row_id)
+            self.checked.add(Path(row_id))
         self.status.config(text=f"共 {len(self.table.get_children())} 次紀錄")
 
     def on_table_click(self, event) -> None:
         row_id = self.table.identify_row(event.y)
         if not row_id:
             return
-        for item in self.table.get_children():
-            values = list(self.table.item(item, "values"))
-            values[0] = "☐"
-            self.table.item(item, values=values)
         values = list(self.table.item(row_id, "values"))
-        values[0] = "☑"
+        run_dir = Path(row_id)
+        if run_dir in self.checked:
+            self.checked.remove(run_dir)
+            values[0] = "☐"
+        else:
+            self.checked.add(run_dir)
+            values[0] = "☑"
         self.table.item(row_id, values=values)
-        self.table.selection_set(row_id)
-        self.checked = Path(row_id)
 
     def show_selected(self) -> None:
-        if self.checked is None:
-            selected = self.table.selection()
-            if selected:
-                self.checked = Path(selected[0])
-        if self.checked is None:
-            messagebox.showinfo("尚未選擇", "請先勾選一筆訓練紀錄。")
+        if not self.checked:
+            messagebox.showinfo("尚未選擇", "請先勾選至少一筆訓練紀錄。")
             return
         try:
-            rows = read_rows(self.checked)
-            if not rows:
-                raise ValueError("這次紀錄尚無 episode 資料。")
-            config = {}
-            config_path = self.checked / "config.json"
-            if config_path.exists():
-                config = json.loads(config_path.read_text(encoding="utf-8"))
-            window = int(config.get("window", 100))
-            smoothing = float(config.get("smoothing", 0.99))
-
-            environment_steps = [row["environment_steps"] for row in rows]
             series = [
                 ("return", "Episode return"),
                 ("episode_steps", "Steps per episode"),
                 ("allied_kills", "Enemy units killed"),
                 ("allied_survivors", "Allied units remaining"),
-                ("rolling_win_rate", f"Win rate (last {window})"),
+                ("rolling_win_rate", "Win rate"),
             ]
             self.figure.clear()
             axes = self.figure.subplots(3, 2)
+            plotted_runs: list[str] = []
+            colors = self.figure.get_cmap("tab10")
+            for run_index, run_dir in enumerate(sorted(self.checked, key=lambda path: path.name)):
+                rows = read_rows(run_dir)
+                if not rows:
+                    continue
+                config_path = run_dir / "config.json"
+                config = json.loads(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
+                smoothing = float(config.get("smoothing", 0.99))
+                environment_steps = [row["environment_steps"] for row in rows]
+                color = colors(run_index % 10)
+                plotted_runs.append(run_dir.name)
+                for axis, (key, title) in zip(axes.flat, series):
+                    values = [row[key] for row in rows]
+                    axis.plot(environment_steps, values, linewidth=0.7, alpha=0.12, color=color)
+                    axis.plot(
+                        environment_steps,
+                        smooth(values, smoothing),
+                        linewidth=1.8,
+                        color=color,
+                        label=run_dir.name,
+                    )
+            if not plotted_runs:
+                raise ValueError("所選紀錄尚無 episode 資料。")
             for axis, (key, title) in zip(axes.flat, series):
-                values = [row[key] for row in rows]
-                axis.plot(
-                    environment_steps,
-                    values,
-                    linewidth=0.8,
-                    alpha=0.18,
-                    color="tab:blue",
-                )
-                axis.plot(
-                    environment_steps,
-                    smooth(values, smoothing),
-                    linewidth=1.8,
-                    color="tab:blue",
-                )
                 axis.set_title(title)
                 axis.set_xlabel("Environment steps")
                 axis.grid(alpha=0.25)
+            axes.flat[0].legend(fontsize=8)
             axes.flat[4].set_ylim(-0.02, 1.02)
             axes.flat[5].axis("off")
             self.figure.suptitle(
-                f"FeUdal on SMAC — {self.checked.name} — smoothing {smoothing:.2f}"
+                f"FeUdal on SMAC — comparison of {len(plotted_runs)} runs"
             )
             self.canvas.draw()
-            self.status.config(text=f"正在顯示：{self.checked.name}")
+            self.status.config(text=f"正在比較 {len(plotted_runs)} 筆紀錄")
         except Exception as error:
             messagebox.showerror("無法畫圖", str(error))
 

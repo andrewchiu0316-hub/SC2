@@ -127,8 +127,6 @@ class Algorithm(BaseAlgorithm):
         # 紀錄最近一次 train 的 loss，給 log 用
         self.last_loss_worker  = 0.0
         self.last_loss_manager = 0.0
-        # [新增] 全域獎勵放大倍率，確保 Actor 與 Critic 權重平衡
-        self.reward_scale = 100.0
         # ================= [新增] 詳細 Loss 紀錄變數 =================
         self.last_worker_policy_loss = 0.0
         self.last_worker_value_loss  = 0.0
@@ -325,8 +323,7 @@ class Algorithm(BaseAlgorithm):
         # [新增] 計算並保留每個 Agent 的獨立 Entropy (沿時間維度平均)
         per_agent_entropy = (entropy * valid_mask).sum(dim=0) / agent_denom  # [A]
         # =================================================================
-        #worker_loss = worker_policy_loss + worker_value_loss - self.entropy_coef * worker_entropy
-        worker_loss = (worker_policy_loss * self.reward_scale) + worker_value_loss - (self.entropy_coef * worker_entropy * self.reward_scale)
+        worker_loss = worker_policy_loss + worker_value_loss - self.entropy_coef * worker_entropy
         
 
         # ================== 2. Manager: anchor-only 版本 (修正版, Global Goal + Task Head) ==================
@@ -530,8 +527,6 @@ class Algorithm(BaseAlgorithm):
 
         # -------- [新增] 每次進來先歸零標記 --------
         self.just_updated = False
-        # [新增] 全域獎勵放大倍率，確保 Actor 與 Critic 權重平衡
-        self.reward_scale = 100.0
         # 轉成 tensor
         # local_state 現在是 list[np.ndarray]，先堆成一個 np.ndarray 再轉 torch
         if isinstance(local_state, np.ndarray):
@@ -562,14 +557,14 @@ class Algorithm(BaseAlgorithm):
               
 
             if isinstance(reward_ext_m, (list, tuple)):
-                r_ext_m_tensor = torch.tensor(reward_ext_m, dtype=torch.float32, device=device) * self.reward_scale
+                r_ext_m_tensor = torch.tensor(reward_ext_m, dtype=torch.float32, device=device)
             else:
-                r_ext_m_tensor = torch.tensor([float(reward_ext_m)] * A, dtype=torch.float32, device=device) * self.reward_scale
+                r_ext_m_tensor = torch.tensor([float(reward_ext_m)] * A, dtype=torch.float32, device=device)
 
             if isinstance(reward_ext_w, (list, tuple)):
-                r_ext_w_tensor = torch.tensor(reward_ext_w, dtype=torch.float32, device=device) * self.reward_scale
+                r_ext_w_tensor = torch.tensor(reward_ext_w, dtype=torch.float32, device=device)
             else:
-                r_ext_w_tensor = torch.tensor([float(reward_ext_w)] * A, dtype=torch.float32, device=device) * self.reward_scale
+                r_ext_w_tensor = torch.tensor([float(reward_ext_w)] * A, dtype=torch.float32, device=device)
             
             # (B) 內在獎勵：r_int = cos( Z_{t+1} - Z_t, goal )
             # 透過 Worker 的 state_encoder 將 state 壓縮到 latent space
@@ -583,8 +578,7 @@ class Algorithm(BaseAlgorithm):
             d_norm = F.normalize(delta_z, dim=-1, eps=eps)
             g_norm = F.normalize(goal_curr, dim=-1, eps=eps)
             #r_int_tensor = (d_norm * g_norm).sum(dim=-1)  # [A]
-            # [修改] 將算出來的內在獎勵也乘上 self.reward_scale
-            r_int_tensor = (d_norm * g_norm).sum(dim=-1) * self.reward_scale  # [A]
+            r_int_tensor = (d_norm * g_norm).sum(dim=-1)  # [A]
 
             # (C) 存入 Buffer：done 使用「當下傳入的 done」
             self._store_step(
