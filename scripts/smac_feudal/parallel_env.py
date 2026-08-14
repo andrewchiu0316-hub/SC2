@@ -14,6 +14,39 @@ def _snapshot(env):
     return observations, global_state, available_actions
 
 
+def _restart_and_reset(env, env_factory, env_kwargs):
+    """Replace a broken SC2 controller and return a ready-to-step environment."""
+    try:
+        env.close()
+    except Exception:
+        pass
+    last_error = None
+    for attempt in range(3):
+        candidate = None
+        try:
+            candidate = env_factory(**env_kwargs)
+            candidate.reset()
+            return candidate
+        except Exception:
+            last_error = traceback.format_exc()
+            if candidate is not None:
+                try:
+                    candidate.close()
+                except Exception:
+                    pass
+            if attempt < 2:
+                time.sleep(2**attempt)
+    raise RuntimeError("SC2 failed to restart after 3 attempts:\n" + str(last_error))
+
+
+def _is_ended_controller_error(error: Exception) -> bool:
+    """Only recover the known PySC2 race where SC2 ended before an action."""
+    message = str(error)
+    return "Status.ended" in message or (
+        error.__class__.__name__ == "ProtocolError" and "actions" in message
+    )
+
+
 def _worker(remote, parent_remote, env_kwargs):
     parent_remote.close()
     env = None
@@ -47,8 +80,25 @@ def _worker(remote, parent_remote, env_kwargs):
                     )
                 result = _snapshot(env)
             elif command == "step":
-                reward, terminated, info = env.step(payload)
-                result = (float(reward), bool(terminated), info, *_snapshot(env))
+                try:
+                    reward, terminated, info = env.step(payload)
+                    result = (float(reward), bool(terminated), info, *_snapshot(env))
+                except Exception as error:
+                    if not _is_ended_controller_error(error):
+                        raise
+                    # SMAC occasionally reports an ended controller before it
+                    # reports ``terminated=True``. Treat it as a zero-reward
+                    # terminal transition and restart only this worker.
+                    env = _restart_and_reset(env, StarCraft2Env, env_kwargs)
+                    info = {
+                        "battle_won": False,
+                        "dead_enemies": 0,
+                        "dead_allies": 0,
+                        "episode_limit": True,
+                        "sc2_controller_restarted": True,
+                    }
+                    print("[SMAC worker] recovered ended SC2 controller", flush=True)
+                    result = (0.0, True, info, *_snapshot(env))
             elif command == "save_replay":
                 env.save_replay()
                 result = None

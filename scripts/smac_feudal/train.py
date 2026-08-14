@@ -501,7 +501,7 @@ def main() -> None:
 
     Algorithm = load_algorithm_class(args.algorithm)
     if args.n_rollout_threads > 1:
-        if args.algorithm in {"haa2c", "feudal_haa2c"}:
+        if args.algorithm in {"feudal", "haa2c", "feudal_haa2c"}:
             run_parallel_haa2c(args, run_dir, Algorithm)
         else:
             run_parallel_independent(args, run_dir, Algorithm)
