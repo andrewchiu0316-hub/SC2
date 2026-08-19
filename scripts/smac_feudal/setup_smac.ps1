@@ -30,7 +30,7 @@ if (-not $SkipPythonInstall) {
         }
     }
     & $Python -m pip install --upgrade pip
-    & $Python -m pip install torch numpy pyyaml matplotlib
+    & $Python -m pip install torch numpy pyyaml matplotlib "tensorboard==2.17.1" "protobuf==3.20.3" "setuptools<81"
     & $Python -m pip install -e $PySC2Source
     & $Python -m pip install -e $SMACSource
 }

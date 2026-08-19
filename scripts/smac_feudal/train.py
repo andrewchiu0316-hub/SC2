@@ -17,6 +17,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import yaml
+from torch.utils.tensorboard import SummaryWriter
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -55,6 +56,15 @@ METRIC_FIELDS = [
     "won",
     "rolling_win_rate",
 ]
+
+
+def write_tensorboard_metrics(writer: SummaryWriter, row: dict[str, float]) -> None:
+    """Write only the four user-facing training metrics to TensorBoard."""
+    step = int(row["episode"])
+    writer.add_scalar("win_rate", float(row["rolling_win_rate"]), step)
+    writer.add_scalar("return", float(row["return"]), step)
+    writer.add_scalar("enemy_kills", float(row["allied_kills"]), step)
+    writer.add_scalar("allied_survivors", float(row["allied_survivors"]), step)
 
 
 def parse_args() -> argparse.Namespace:
@@ -177,6 +187,7 @@ def run_parallel_haa2c(args, run_dir: Path, Algorithm) -> None:
         env_kwargs, startup_batch_size=args.sc2_startup_batch_size
     )
     csv_file = None
+    tensorboard_writer = None
     try:
         info = envs.get_env_info()
         agent = Algorithm(
@@ -202,6 +213,7 @@ def run_parallel_haa2c(args, run_dir: Path, Algorithm) -> None:
         csv_writer = csv.DictWriter(csv_file, fieldnames=METRIC_FIELDS)
         if csv_path.stat().st_size == 0:
             csv_writer.writeheader()
+        tensorboard_writer = SummaryWriter(log_dir=str(run_dir / "tensorboard"), flush_secs=10)
 
         observations, global_states, available = envs.reset()
         alive = available[:, :, 1:].any(axis=-1)
@@ -257,6 +269,7 @@ def run_parallel_haa2c(args, run_dir: Path, Algorithm) -> None:
                 }
                 rows.append(row)
                 csv_writer.writerow(row)
+                write_tensorboard_metrics(tensorboard_writer, row)
                 print(
                     f"episode={episode:6d} env={env_id:2d} return={row['return']:9.3f} "
                     f"steps={row['episode_steps']:3d} total_steps={env_steps:9d}/{args.total_steps} "
@@ -328,6 +341,8 @@ def run_parallel_haa2c(args, run_dir: Path, Algorithm) -> None:
         if args.save_replay:
             envs.save_replay()
     finally:
+        if tensorboard_writer is not None:
+            tensorboard_writer.close()
         if csv_file is not None:
             csv_file.close()
         envs.close()
@@ -357,6 +372,7 @@ def run_parallel_independent(args, run_dir: Path, Algorithm) -> None:
     ]
     envs = SubprocSMACVecEnv(env_kwargs, startup_batch_size=args.sc2_startup_batch_size)
     csv_file = None
+    tensorboard_writer = None
     try:
         info = envs.get_env_info()
         agents = [
@@ -386,6 +402,7 @@ def run_parallel_independent(args, run_dir: Path, Algorithm) -> None:
         csv_writer = csv.DictWriter(csv_file, fieldnames=METRIC_FIELDS)
         if csv_path.stat().st_size == 0:
             csv_writer.writeheader()
+        tensorboard_writer = SummaryWriter(log_dir=str(run_dir / "tensorboard"), flush_secs=10)
 
         observations, global_states, available = envs.reset()
         alive = available[:, :, 1:].any(axis=-1)
@@ -439,6 +456,7 @@ def run_parallel_independent(args, run_dir: Path, Algorithm) -> None:
                 }
                 rows.append(row)
                 csv_writer.writerow(row)
+                write_tensorboard_metrics(tensorboard_writer, row)
                 print(
                     f"episode={episode:6d} replica={env_id:2d} return={row['return']:9.3f} "
                     f"steps={row['episode_steps']:3d} total_steps={env_steps:9d}/{args.total_steps} "
@@ -481,6 +499,8 @@ def run_parallel_independent(args, run_dir: Path, Algorithm) -> None:
         if args.save_replay:
             envs.save_replay()
     finally:
+        if tensorboard_writer is not None:
+            tensorboard_writer.close()
         if csv_file is not None:
             csv_file.close()
         envs.close()
@@ -540,6 +560,7 @@ def main() -> None:
     csv_writer = csv.DictWriter(csv_file, fieldnames=METRIC_FIELDS)
     if csv_path.stat().st_size == 0:
         csv_writer.writeheader()
+    tensorboard_writer = SummaryWriter(log_dir=str(run_dir / "tensorboard"), flush_secs=10)
 
     try:
         episode = start_episode - 1
@@ -602,6 +623,7 @@ def main() -> None:
             }
             rows.append(row)
             csv_writer.writerow(row)
+            write_tensorboard_metrics(tensorboard_writer, row)
             csv_file.flush()
 
             print(
@@ -634,6 +656,7 @@ def main() -> None:
         if args.save_replay:
             env.save_replay()
     finally:
+        tensorboard_writer.close()
         csv_file.close()
         env.close()
 
