@@ -16,7 +16,7 @@ class FiLMLayer(nn.Module):
 
 
 class FeudalManager(nn.Module):
-    """Global state encoder with FeUdal goal and value heads."""
+    """Per-step recurrent state encoder with goal and shared external value heads."""
 
     def __init__(
         self,
@@ -93,13 +93,13 @@ class FeudalWorkerActor(nn.Module):
         return self.action_head(output), new_hidden
 
 
-class CentralValueCritic(nn.Module):
-    """HAA2C centralized V critic conditioned on the SMAC global state."""
+class IntrinsicValueCritic(nn.Module):
+    """One worker's remaining-goal return; independent of its actor encoder."""
 
-    def __init__(self, state_dim: int, hidden_dim: int):
+    def __init__(self, state_dim, obs_dim, goal_dim, hidden_dim):
         super().__init__()
         self.network = nn.Sequential(
-            nn.Linear(state_dim, hidden_dim),
+            nn.Linear(state_dim + obs_dim + goal_dim + 1, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
@@ -108,5 +108,9 @@ class CentralValueCritic(nn.Module):
             nn.Linear(hidden_dim, 1),
         )
 
-    def forward(self, global_state):
-        return self.network(global_state).squeeze(-1)
+    def forward(self, global_state, observation, goal, remaining_fraction):
+        inputs = torch.cat(
+            (global_state, observation, goal, remaining_fraction.unsqueeze(-1)),
+            dim=-1,
+        )
+        return self.network(inputs).squeeze(-1)

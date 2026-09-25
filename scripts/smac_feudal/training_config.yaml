@@ -3,11 +3,11 @@
 # 8m = 8 個 Marines 對 8 個 Marines
 map: 3s5z
 
-# Algorithms: feudal, feudal_test, feudal_haa2c, haa2c, qmix.
-algorithm: haa2c
+# Algorithms: gc_mrl, feudal, feudal_test, feudal_haa2c, haa2c, qmix.
+algorithm: feudal_haa2c
 
 # 總環境步數；達到後會在當前回合結束時停止
-total_steps: 10000000
+total_steps: 4000000
 
 # 隨機種子
 seed: 1
@@ -15,12 +15,14 @@ seed: 1
 # 電腦對手難度（1～10）
 difficulty: 7
 
-# Use 8 parallel environments on this Windows machine to avoid SC2 startup failures.
+# Use 10 parallel environments; SC2 instances are started one at a time below.
 n_rollout_threads: 10
 rollout_steps: 200
 
-# Launch only this many new SC2 instances at once; all 20 step in parallel afterwards.
-sc2_startup_batch_size: 2
+# Launch one SC2 instance at a time.  Windows SC2 can race while writing its
+# temporary launch map when multiple games are created simultaneously.
+# All environments still step in parallel after startup.
+sc2_startup_batch_size: 1
 
 # SC2 每個 agent action 前進的遊戲 frame 數
 step_mul: 8
@@ -44,4 +46,4 @@ save_replay: false
 run_dir:
 
 # 要接續訓練時填入 checkpoint 完整路徑；新訓練請留空
-resume_checkpoint:
+resume_checkpoint: #C:\Users\邱鵬\Desktop\SC2\runs\20260908_230808_haa2c\checkpoints\episode_36100.pt

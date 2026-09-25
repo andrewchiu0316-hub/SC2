@@ -1,0 +1,41 @@
+# Direct counterpart of epymarl/src/config/algs/mappo_ns.yaml plus the
+# inherited EPyMARL defaults it relies on.
+action_selector: soft_policies
+mask_before_softmax: true
+runner: parallel
+use_tensorboard: true
+
+buffer_size: 4
+batch_size: 4
+target_update_interval_or_tau: 200
+lr: 0.0003
+hidden_dim: 64
+use_rnn: false
+grad_norm_clip: 10.0
+obs_agent_id: false
+obs_last_action: false
+obs_individual_obs: false
+common_reward: true
+
+standardise_rewards: true
+gamma: 0.99
+epochs: 4
+eps_clip: 0.2
+entropy_coef: 0.01
+worker_value_coef: 0.5
+worker_intrinsic_coef: 0.5
+
+manager_mode: deterministic_cos
+manager_actor_coef: 1.0
+manager_value_coef: 0.5
+manager_advantage_norm: true
+manager_advantage_clip: 10.0
+manager_entropy_coef: 0.0
+goal_tanh: true
+goal_scale: 1.0
+c_step: 10
+goal_dim_mode: obs
+goal_std_init: 0.5
+goal_clip: null
+name: mappo_ns_feudal
+t_max: 20050000

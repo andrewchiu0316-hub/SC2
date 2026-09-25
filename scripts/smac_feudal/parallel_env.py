@@ -40,10 +40,18 @@ def _restart_and_reset(env, env_factory, env_kwargs):
 
 
 def _is_ended_controller_error(error: Exception) -> bool:
-    """Only recover the known PySC2 race where SC2 ended before an action."""
+    """Recognize transient SC2 end/restart failures safe to recover per worker."""
     message = str(error)
-    return "Status.ended" in message or (
+    return (
+        "Status.ended" in message
+        # SMAC can catch Status.ended itself, then fail while recreating its
+        # temporary SC2 map.  The final raised exception is RequestError, so
+        # the original ProtocolError is only visible in its exception chain.
+        or "InvalidMapData" in message
+        or "TempLaunchMap" in message
+        or (
         error.__class__.__name__ == "ProtocolError" and "actions" in message
+        )
     )
 
 
@@ -97,7 +105,7 @@ def _worker(remote, parent_remote, env_kwargs):
                         "episode_limit": True,
                         "sc2_controller_restarted": True,
                     }
-                    print("[SMAC worker] recovered ended SC2 controller", flush=True)
+                    print("[SMAC worker] recovered SC2 controller/map restart failure", flush=True)
                     result = (0.0, True, info, *_snapshot(env))
             elif command == "save_replay":
                 env.save_replay()
@@ -205,7 +213,13 @@ class SubprocSMACVecEnv:
             return
         for remote, process in zip(self.remotes, self.processes):
             if process.is_alive():
-                remote.send(("close", None))
+                try:
+                    remote.send(("close", None))
+                except (EOFError, BrokenPipeError, OSError):
+                    # A worker which failed during reset has already closed
+                    # its side of the pipe.  Continue cleaning up the other
+                    # workers instead of masking the original SC2 failure.
+                    pass
         for remote, process in zip(self.remotes, self.processes):
             if process.is_alive():
                 try:

@@ -18,11 +18,12 @@
 - 我方剩餘單位數
 - 單回合勝負與最近 100 回合勝率
 
-輸出位於 `runs/smac_feudal_<地圖>_<時間>/`，不需要 TensorBoard 或網路：
+輸出位於 `runs/<時間>_<演算法>/`：
 
 - `metrics.csv`
 - `training_metrics.png`
 - `checkpoints/`
+- `tensorboard/`（TensorBoard event logs）
 
 ## 1. 安裝 StarCraft II
 
@@ -78,3 +79,14 @@ chart_smoothing: 0.99
 ```powershell
 C:\Users\P\Desktop\SC2\.venv-smac\Scripts\python.exe .\plot_run.py --run 8m_validation --show
 ```
+
+## 5. 使用 TensorBoard 看即時數據
+
+在另一個 PowerShell 視窗、專案根目錄執行：
+
+```powershell
+.\.venv-smac\Scripts\tensorboard.exe --logdir .\runs
+```
+
+開啟終端顯示的網址（通常是 `http://localhost:6006`）。Scalars 的前四個項目依序為
+Episode return、最近 100 局勝率、擊殺敵人數、我軍剩餘單位數；其後還有回合步數與訓練 loss。

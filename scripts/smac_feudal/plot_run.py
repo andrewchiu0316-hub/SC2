@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import os
 from pathlib import Path
 
@@ -53,6 +54,17 @@ def read_rows(csv_path: Path) -> list[dict[str, float]]:
     return rows
 
 
+def read_advantage_rows(run_dir: Path) -> list[dict[str, float]]:
+    csv_path = run_dir / "advantages.csv"
+    if not csv_path.is_file():
+        return []
+    with csv_path.open("r", newline="", encoding="utf-8") as stream:
+        return [
+            {key: float(value) for key, value in row.items()}
+            for row in csv.DictReader(stream)
+        ]
+
+
 def smooth(values, factor: float):
     if not values:
         return []
@@ -99,7 +111,91 @@ def make_plot(run_dir: Path) -> Path:
         axis.set_xlabel("Environment steps")
         axis.grid(alpha=0.25)
     axes.flat[4].set_ylim(-0.02, 1.02)
-    axes.flat[5].axis("off")
+    advantage_axis = axes.flat[5]
+    advantage_rows = read_advantage_rows(run_dir)
+    episode_advantage_rows = [
+        row for row in advantage_rows
+        if math.isfinite(row.get("episode", float("nan")))
+    ]
+    if episode_advantage_rows:
+        for key, label, color in (
+            ("external_advantage_mean", "mean A_ext", "tab:blue"),
+            ("intrinsic_advantage_mean", "mean A_int raw", "tab:orange"),
+            (
+                "weighted_intrinsic_advantage_mean",
+                "mean beta A_int",
+                "tab:green",
+            ),
+        ):
+            valid_rows = [
+                row for row in episode_advantage_rows
+                if math.isfinite(row.get(key, float("nan")))
+            ]
+            if not valid_rows:
+                continue
+            advantage_steps = [row["episode"] for row in valid_rows]
+            values = [row[key] for row in valid_rows]
+            advantage_axis.plot(advantage_steps, values, linewidth=0.7, alpha=0.18, color=color)
+            advantage_axis.plot(
+                advantage_steps, smooth(values, smoothing), linewidth=1.8,
+                color=color, label=label,
+            )
+        advantage_axis.legend(loc="upper left", fontsize=8)
+        ratio_axis = advantage_axis.twinx()
+        raw_ratio_rows = [
+            row
+            for row in episode_advantage_rows
+            if math.isfinite(row.get("intrinsic_advantage_abs_mean", float("nan")))
+            and math.isfinite(row.get("external_advantage_abs_mean", float("nan")))
+            and row["external_advantage_abs_mean"] > 0
+        ]
+        if raw_ratio_rows:
+            raw_ratios = []
+            for row in raw_ratio_rows:
+                ratio = row.get("intrinsic_to_external_raw_ratio", float("nan"))
+                if not math.isfinite(ratio):
+                    ratio = (
+                        row["intrinsic_advantage_abs_mean"]
+                        / row["external_advantage_abs_mean"]
+                    )
+                raw_ratios.append(ratio)
+            ratio_axis.plot(
+                [row["episode"] for row in raw_ratio_rows],
+                smooth(raw_ratios, smoothing),
+                linewidth=1.5,
+                linestyle="-.",
+                color="tab:purple",
+                label="|A_int| / |A_ext| raw",
+            )
+        ratio_rows = [
+            row
+            for row in episode_advantage_rows
+            if math.isfinite(row.get("intrinsic_to_external_advantage_ratio", float("nan")))
+        ]
+        if ratio_rows:
+            ratio_axis.plot(
+                [row["episode"] for row in ratio_rows],
+                smooth(
+                    [row["intrinsic_to_external_advantage_ratio"] for row in ratio_rows],
+                    smoothing,
+                ),
+                linewidth=1.5,
+                linestyle="--",
+                color="tab:red",
+                label="|beta A_int| / |A_ext|",
+            )
+        if raw_ratio_rows or ratio_rows:
+            ratio_axis.set_ylabel("Intrinsic / external")
+            ratio_axis.legend(loc="upper right", fontsize=8)
+    else:
+        advantage_axis.text(
+            0.5, 0.5, "No advantage data", ha="center", va="center",
+            transform=advantage_axis.transAxes,
+        )
+    advantage_axis.axhline(0.0, color="black", linewidth=0.8)
+    advantage_axis.set_title("Episode-mean raw advantages and magnitude ratios")
+    advantage_axis.set_xlabel("Completed episode")
+    advantage_axis.grid(alpha=0.25)
     fig.suptitle(f"FeUdal on SMAC — {run_dir.name} — smoothing {smoothing:.2f}")
     output = run_dir / "training_metrics.png"
     fig.savefig(output, dpi=150)

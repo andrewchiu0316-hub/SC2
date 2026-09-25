@@ -522,8 +522,12 @@ class Algorithm(BaseAlgorithm):
         self.parallel_goal_remaining = torch.zeros(
             env_count, dtype=torch.long, device=self.device
         )
+        # One manager decision/goal segment per environment.  Keeping the
+        # hidden state from collection makes the manager replay on-policy.
+        self.parallel_manager_segments = [None] * env_count
         self.worker_buffer = []
         self.update_count = 0
+        self.manager_update_count = 0
         self.last_critic_loss = 0.0
         self.last_factor_mean = 1.0
 
@@ -550,8 +554,8 @@ class Algorithm(BaseAlgorithm):
         due = torch.nonzero(self.parallel_goal_remaining <= 0, as_tuple=False).flatten()
         if len(due):
             hidden = (
-                self.parallel_manager_hidden[0][:, due].detach(),
-                self.parallel_manager_hidden[1][:, due].detach(),
+                self.parallel_manager_hidden[0][:, due].detach().clone(),
+                self.parallel_manager_hidden[1][:, due].detach().clone(),
             )
             with torch.no_grad():
                 goals, _, next_hidden = self.manager(states[due].unsqueeze(0), hidden)
@@ -561,6 +565,18 @@ class Algorithm(BaseAlgorithm):
             self.parallel_manager_hidden = tuple(manager_hidden)
             self.parallel_goals[due] = goals[0].detach()
             self.parallel_goal_remaining[due] = self.c_steps
+            for offset, env_id_tensor in enumerate(due):
+                env_id = int(env_id_tensor.item())
+                self.parallel_manager_segments[env_id] = {
+                    "state": states[env_id].detach().clone(),
+                    "obs": observations[env_id].detach().clone(),
+                    "alive": alive[env_id].detach().clone(),
+                    "hidden": (
+                        hidden[0][:, offset : offset + 1].detach().clone(),
+                        hidden[1][:, offset : offset + 1].detach().clone(),
+                    ),
+                    "rewards": [],
+                }
 
         with torch.no_grad():
             logits, _, worker_hidden = self.worker(
@@ -586,6 +602,7 @@ class Algorithm(BaseAlgorithm):
         rewards = torch.as_tensor(rewards, dtype=torch.float32, device=self.device).reshape(-1)
         done = torch.as_tensor(dones, dtype=torch.float32, device=self.device).reshape(-1)
         next_obs = torch.as_tensor(next_local_states, dtype=torch.float32, device=self.device)
+        next_states = torch.as_tensor(next_global_states, dtype=torch.float32, device=self.device)
         cache = self._parallel_step_cache
         with torch.no_grad():
             start_latent = self.worker.state_encoder(cache["obs"])
@@ -597,6 +614,18 @@ class Algorithm(BaseAlgorithm):
             "intrinsic": intrinsic.detach().clone(),
         })
         self.parallel_goal_remaining -= 1
+        completed_segments = []
+        for env_id, segment in enumerate(self.parallel_manager_segments):
+            if segment is None:
+                continue
+            segment["rewards"].append(rewards[env_id].detach().clone())
+            terminal = bool(done[env_id].item() > 0.5)
+            if terminal or self.parallel_goal_remaining[env_id] <= 0:
+                segment["next_state"] = next_states[env_id].detach().clone()
+                segment["next_obs"] = next_obs[env_id].detach().clone()
+                segment["done"] = terminal
+                completed_segments.append(segment)
+                self.parallel_manager_segments[env_id] = None
         terminal = done > 0.5
         if terminal.any():
             self.parallel_manager_hidden = self._masked_hidden(self.parallel_manager_hidden, terminal)
@@ -604,8 +633,81 @@ class Algorithm(BaseAlgorithm):
             self.parallel_goal_remaining[terminal] = 0
             self.parallel_goals[terminal] = 0.0
         self._parallel_step_cache = None
+        if completed_segments:
+            self._train_manager_segments(completed_segments)
 
-    def _train_parallel(self, next_global_state=None, next_alive_mask=None):
+        # Worker and manager both learn on c-step segments.  The worker
+        # buffer contains one vectorized transition per time step, so this is
+        # c_steps * n_rollout_threads samples per shared-weight update.
+        if len(self.worker_buffer) >= self.c_steps:
+            if next_alive_masks is None:
+                next_alive_masks = np.ones(
+                    (self.parallel_env_count, self.n_agents), dtype=np.float32
+                )
+            self._train_parallel(next_obs, next_alive_masks)
+
+    def _train_manager_segments(self, segments):
+        """Update the manager from complete c-step (or terminal) trajectories."""
+        if not segments:
+            return None
+        device = self.device
+        states = torch.stack([segment["state"] for segment in segments])
+        next_states = torch.stack([segment["next_state"] for segment in segments])
+        observations = torch.stack([segment["obs"] for segment in segments])
+        next_observations = torch.stack([segment["next_obs"] for segment in segments])
+        alive = torch.stack([segment["alive"] for segment in segments])
+        hidden = (
+            torch.cat([segment["hidden"][0] for segment in segments], dim=1),
+            torch.cat([segment["hidden"][1] for segment in segments], dim=1),
+        )
+        goals, values, hidden_after = self.manager(states.unsqueeze(0), hidden)
+        goals = goals[0]
+        values = values[0]
+        with torch.no_grad():
+            returns = []
+            for segment in segments:
+                total = torch.tensor(0.0, device=device)
+                discount = 1.0
+                for reward in segment["rewards"]:
+                    total = total + discount * reward
+                    discount *= self.gamma
+                returns.append(total)
+            returns = torch.stack(returns)
+            nonterminal = torch.tensor(
+                [not segment["done"] for segment in segments], device=device
+            )
+            if nonterminal.any():
+                _, bootstrap_values, _ = self.manager(
+                    next_states.unsqueeze(0),
+                    tuple(value.detach() for value in hidden_after),
+                )
+                returns = returns + nonterminal.float() * discount * bootstrap_values[0]
+            start_latent = self.worker.state_encoder(observations)
+            end_latent = self.worker.state_encoder(next_observations)
+            deltas = end_latent - start_latent
+        cosine_per_agent = (
+            F.normalize(deltas, dim=-1, eps=1e-8)
+            * F.normalize(goals, dim=-1, eps=1e-8)
+        ).sum(dim=-1)
+        active_denom = alive.sum().clamp_min(1.0)
+        advantage = (returns - values).detach().clamp(-15.0, 15.0)
+        goal_loss = -(advantage.unsqueeze(-1) * cosine_per_agent * alive).sum() / active_denom
+        value_loss = F.smooth_l1_loss(values, returns.detach())
+        manager_loss = goal_loss + self.beta_mgr_v * value_loss
+        self.manager_opt.zero_grad()
+        manager_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.manager.parameters(), max_norm=5.0)
+        self.manager_opt.step()
+        self.last_loss_manager = float(manager_loss.item())
+        self.last_manager_goal_loss = float(goal_loss.item())
+        self.last_manager_value_loss = float(value_loss.item())
+        self.last_manager_cos_sim = float((cosine_per_agent * alive).sum().item() / active_denom.item())
+        self.last_manager_return = float(returns.mean().item())
+        self.last_manager_value_pred = float(values.detach().mean().item())
+        self.manager_update_count += 1
+        return self.last_loss_manager
+
+    def _train_parallel(self, next_local_state=None, next_alive_mask=None):
         if not self.worker_buffer:
             return None
         device = self.device
@@ -639,9 +741,21 @@ class Algorithm(BaseAlgorithm):
         worker_rewards = self.alpha_int * intrinsic + self.eta_ext * rewards.unsqueeze(-1)
         next_values = torch.zeros_like(values)
         next_values[:-1] = values[1:].detach()
-        # The final rollout element is bootstrapped as zero.  This avoids
-        # mixing global state with local observations; the next rollout starts
-        # a fresh recurrent segment and supplies the following value estimate.
+        # Bootstrap the final non-terminal state using its real local
+        # observation and the hidden state produced during collection.
+        if next_local_state is not None and next_alive_mask is not None:
+            next_observations = torch.as_tensor(
+                next_local_state, dtype=torch.float32, device=device
+            )
+            next_alive = torch.as_tensor(
+                next_alive_mask, dtype=torch.float32, device=device
+            )
+            with torch.no_grad():
+                _, bootstrap_values, _ = self.worker(
+                    next_observations.unsqueeze(0), hidden,
+                    goals[-1:].detach(),
+                )
+            next_values[-1] = bootstrap_values[0] * next_alive
         alive_next = torch.zeros_like(alive)
         alive_next[:-1] = alive[1:]
         if next_alive_mask is not None:
@@ -667,50 +781,10 @@ class Algorithm(BaseAlgorithm):
         torch.nn.utils.clip_grad_norm_(self.worker.parameters(), 5.0)
         self.worker_opt.step()
 
-        # A batched manager objective: one goal decision per environment every c_steps.
-        starts = list(range(0, time_steps, self.c_steps))
-        start_states = torch.cat([states[index] for index in starts], dim=0)
-        start_alive = torch.cat([alive[index] for index in starts], dim=0)
-        with torch.no_grad():
-            end_latents = []
-            returns = []
-            for start in starts:
-                end = min(start + self.c_steps - 1, time_steps - 1)
-                end_latents.append(self.worker.state_encoder(observations[end]))
-                accumulated = torch.zeros(env_count, device=device)
-                discount = 1.0
-                for index in range(start, end + 1):
-                    accumulated += discount * rewards[index]
-                    discount *= self.gamma
-                returns.append(accumulated)
-            start_latents = torch.cat([self.worker.state_encoder(observations[index]) for index in starts], dim=0)
-            manager_returns = torch.cat(returns, dim=0)
-            manager_deltas = torch.cat(end_latents, dim=0) - start_latents
-        manager_hidden = self.manager.init_hidden(start_states.shape[0])
-        manager_goals, manager_values, _ = self.manager(start_states.unsqueeze(0), manager_hidden)
-        manager_goals = manager_goals[0]
-        manager_values = manager_values[0]
-        cosine = (F.normalize(manager_deltas, dim=-1, eps=1e-8)
-                  * F.normalize(manager_goals, dim=-1, eps=1e-8)).sum(dim=-1)
-        active_denom = start_alive.sum().clamp_min(1.0)
-        cosine = (cosine * start_alive).sum() / active_denom
-        manager_advantage = (manager_returns - manager_values).detach().clamp(-15.0, 15.0)
-        manager_loss = -(manager_advantage.unsqueeze(-1) * (F.normalize(manager_deltas, dim=-1, eps=1e-8)
-                         * F.normalize(manager_goals, dim=-1, eps=1e-8)).sum(dim=-1)
-                         * start_alive).sum() / active_denom
-        manager_value_loss = F.smooth_l1_loss(manager_values, manager_returns.detach())
-        manager_loss = manager_loss + self.beta_mgr_v * manager_value_loss
-        self.manager_opt.zero_grad()
-        manager_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.manager.parameters(), 5.0)
-        self.manager_opt.step()
-
         self.last_loss_worker = float(worker_loss.item())
-        self.last_loss_manager = float(manager_loss.item())
         self.last_critic_loss = float(worker_value_loss.item())
         self.last_factor_mean = 1.0
         self.last_worker_mean_reward = float(worker_rewards.mean().item())
-        self.last_manager_cos_sim = float(cosine.item())
         self.update_count += 1
         self.worker_buffer.clear()
         self.parallel_worker_rollout_start_hidden = tuple(value.detach().clone() for value in self.parallel_worker_hidden)
@@ -718,7 +792,7 @@ class Algorithm(BaseAlgorithm):
 
     def finalize_training(self, next_global_state=None, next_local_state=None, next_alive_mask=None):
         if getattr(self, "parallel_mode", False) and self.worker_buffer:
-            return self._train_parallel(next_global_state, next_alive_mask)
+            return self._train_parallel(next_local_state, next_alive_mask)
         return None
 
     # ----------------- sample_action：一邊收資料、一邊決定何時 train -----------------

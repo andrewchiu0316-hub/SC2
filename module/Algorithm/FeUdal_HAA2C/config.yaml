@@ -4,7 +4,7 @@ gae_lambda: 0.95
 manager_c_steps: 10
 worker_update_steps: 200
 
-# FeUdal manager. Worker GAE uses the environment reward directly.
+# Manager LSTM and shared external V run every step; goals change every c steps.
 manager_hidden_dim: 256
 manager_learning_rate: 0.0005
 manager_advantage_clip: 15.0
@@ -16,10 +16,22 @@ actor_learning_rate: 0.0005
 a2c_epoch: 5
 entropy_coef: 0.01
 fixed_order: false
+# PPO clipping only applies to the worker currently being updated.
+# The HAA2C factor still contains the ratios of earlier workers.
+worker_ratio_clip: 0.2
 
-# Centralized HAA2C critic.
-critic_hidden_dim: 128
-critic_learning_rate: 0.0005
+# Individual intrinsic rewards: cosine(z_segment_end - z_segment_start, goal at issue).
+# Write one reward at each goal segment's final valid transition; returns end at
+# goal replacement, worker death, or episode termination.
+# Mix raw advantages first, then normalize each worker's valid samples.
+intrinsic_coef: 0.05
+intrinsic_hidden_dim: 128
+intrinsic_learning_rate: 0.0005
+intrinsic_critic_epoch: 5
+intrinsic_value_loss_coef: 1.0
+
+# Per-step GAE return training for the manager's shared value head.
+# Uses manager_optimizer and manager_learning_rate, including the encoder/LSTM.
 critic_epoch: 5
 value_loss_coef: 1.0
 use_clipped_value_loss: true

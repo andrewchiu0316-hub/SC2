@@ -1,4 +1,5 @@
 import os
+import warnings
 from types import SimpleNamespace
 
 import numpy as np
@@ -8,9 +9,9 @@ import torch.nn.functional as F
 
 from module.Algorithm.base_algorithm import BaseAlgorithm
 from module.Algorithm.FeUdal_HAA2C.model.model import (
-    CentralValueCritic,
     FeudalManager,
     FeudalWorkerActor,
+    IntrinsicValueCritic,
 )
 from Tools import utils
 
@@ -46,16 +47,21 @@ class Algorithm(BaseAlgorithm):
         self.huber_delta = float(self.cfg["huber_delta"])
         self.max_grad_norm = float(self.cfg["max_grad_norm"])
         self.fixed_order = bool(self.cfg.get("fixed_order", False))
+        self.worker_ratio_clip = float(self.cfg.get("worker_ratio_clip", 0.2))
+        if not 0.0 < self.worker_ratio_clip < 1.0:
+            raise ValueError("worker_ratio_clip must be in the open interval (0, 1)")
         self.manager_advantage_clip = float(
             self.cfg["manager_advantage_clip"]
         )
         self.manager_value_loss_coef = float(
             self.cfg["manager_value_loss_coef"]
         )
+        self.intrinsic_coef = float(self.cfg["intrinsic_coef"])
+        self.intrinsic_critic_epoch = int(self.cfg["intrinsic_critic_epoch"])
+        self.intrinsic_value_loss_coef = float(self.cfg["intrinsic_value_loss_coef"])
 
         worker_hidden_dim = int(self.cfg["worker_hidden_dim"])
         manager_hidden_dim = int(self.cfg["manager_hidden_dim"])
-        critic_hidden_dim = int(self.cfg["critic_hidden_dim"])
         self.goal_dim = worker_hidden_dim
 
         self.manager = FeudalManager(
@@ -75,8 +81,17 @@ class Algorithm(BaseAlgorithm):
                 for _ in range(self.n_agents)
             ]
         ).to(self.device)
-        self.critic = CentralValueCritic(
-            self.global_state_dim, critic_hidden_dim
+
+        self.intrinsic_critics = nn.ModuleList(
+            [
+                IntrinsicValueCritic(
+                    self.global_state_dim,
+                    self.obs_dim,
+                    self.goal_dim,
+                    int(self.cfg["intrinsic_hidden_dim"]),
+                )
+                for _ in range(self.n_agents)
+            ]
         ).to(self.device)
 
         optimizer_eps = float(self.cfg["optimizer_eps"])
@@ -93,15 +108,19 @@ class Algorithm(BaseAlgorithm):
             )
             for worker in self.workers
         ]
-        self.critic_optimizer = torch.optim.Adam(
-            self.critic.parameters(),
-            lr=float(self.cfg["critic_learning_rate"]),
-            eps=optimizer_eps,
-        )
+        self.intrinsic_critic_optimizers = [
+            torch.optim.Adam(
+                critic.parameters(),
+                lr=float(self.cfg["intrinsic_learning_rate"]),
+                eps=optimizer_eps,
+            )
+            for critic in self.intrinsic_critics
+        ]
 
         self.manager_hidden = None
         self.worker_hidden = None
         self.manager_segment_start_hidden = None
+        self.manager_rollout_start_hidden = None
         self.worker_rollout_start_hidden = None
         self.current_goal = None
         self.manager_buffer = []
@@ -110,6 +129,7 @@ class Algorithm(BaseAlgorithm):
         self.parallel_mode = False
         self.parallel_env_count = 0
         self.parallel_manager_hidden = None
+        self.parallel_manager_rollout_start_hidden = None
         self.parallel_worker_hidden = None
         self.parallel_worker_rollout_start_hidden = None
         self.parallel_current_goal = None
@@ -124,12 +144,28 @@ class Algorithm(BaseAlgorithm):
         self.last_sequential_order = list(range(self.n_agents))
         self.last_per_agent_policy_loss = [0.0] * self.n_agents
         self.last_per_agent_ratio = [1.0] * self.n_agents
+        self.last_per_agent_ratio_clip_fraction = [0.0] * self.n_agents
         self.last_manager_cos_sim = 0.0
         self.last_manager_advantage = 0.0
         self.last_manager_value_loss = 0.0
         self.last_manager_return = 0.0
         self.last_manager_value_pred = 0.0
+        self.last_manager_segment_metrics = []
         self.last_worker_mean_reward = 0.0
+        self.last_worker_mean_intrinsic_reward = 0.0
+        self.last_per_agent_intrinsic_reward = [0.0] * self.n_agents
+        self.last_intrinsic_critic_loss = 0.0
+        self.last_per_agent_intrinsic_critic_loss = [0.0] * self.n_agents
+        self.last_worker_mean_external_advantage = 0.0
+        self.last_worker_mean_intrinsic_advantage = 0.0
+        self.last_worker_mean_abs_external_advantage = 0.0
+        self.last_worker_mean_abs_intrinsic_advantage = 0.0
+        self.last_worker_mean_abs_weighted_intrinsic_advantage = 0.0
+        self.last_worker_raw_intrinsic_to_external_advantage_ratio = 0.0
+        self.last_worker_intrinsic_to_external_advantage_ratio = 0.0
+        self.last_external_advantages = None
+        self.last_intrinsic_advantages = None
+        self.last_advantage_alive_masks = None
         self.worker_update_count = 0
         self.manager_update_count = 0
         self.just_updated = False
@@ -139,11 +175,138 @@ class Algorithm(BaseAlgorithm):
     def _detach_hidden(hidden):
         return tuple(part.detach().clone() for part in hidden)
 
+    def _intrinsic_values(self, states, observations, goals, goal_remaining):
+        remaining_fraction = goal_remaining.to(states.dtype) / self.manager_c_steps
+        return torch.stack(
+            [
+                critic(
+                    states,
+                    observations[..., agent_id, :],
+                    goals[..., agent_id, :],
+                    remaining_fraction,
+                )
+                for agent_id, critic in enumerate(self.intrinsic_critics)
+            ],
+            dim=-1,
+        )
+
+    def _compute_intrinsic_rewards(
+        self, observations, next_observations, goals, alive, next_alive
+    ):
+        """Return goal-segment pre-FiLM alignment and its valid-worker mask.
+
+        ``observations`` is the observation when a manager goal was issued and
+        ``next_observations`` is the observation at that goal segment's end.
+        A worker that dies during the segment has no reliable end observation,
+        so its segment reward is kept at zero.
+        """
+        with torch.no_grad():
+            rewards = []
+            valid_masks = []
+            for agent_id, worker in enumerate(self.workers):
+                z_t = worker.state_encoder(observations[..., agent_id, :])
+                z_next = worker.state_encoder(next_observations[..., agent_id, :])
+                displacement = z_next - z_t
+                reward = F.cosine_similarity(
+                    displacement, goals[..., agent_id, :], dim=-1, eps=1e-8
+                )
+                valid = (
+                    (alive[..., agent_id] > 0)
+                    & (next_alive[..., agent_id] > 0)
+                    & (displacement.norm(dim=-1) > 1e-8)
+                )
+                rewards.append(reward.masked_fill(~valid, 0.0))
+                valid_masks.append(valid)
+            return torch.stack(rewards, dim=-1), torch.stack(valid_masks, dim=-1)
+
+    def _intrinsic_transition(self, cache, next_states, next_obs, next_alive, done):
+        with torch.no_grad():
+            # The reward is assigned only when this goal segment finishes.
+            # Keeping intermediate steps at zero lets intrinsic GAE propagate
+            # the segment-end result backwards without counting it C times.
+            rewards = torch.zeros_like(cache["alive"])
+            intrinsic_done = (
+                (done > 0.5).unsqueeze(-1)
+                | (cache["goal_remaining"] <= 1).unsqueeze(-1)
+                | (cache["alive"] <= 0)
+                | (next_alive <= 0)
+            )
+            next_values = self._intrinsic_values(
+                next_states,
+                next_obs,
+                cache["goal"],
+                (cache["goal_remaining"] - 1).clamp_min(0),
+            ).masked_fill(intrinsic_done, 0.0)
+        return {
+            "intrinsic_reward": rewards,
+            "intrinsic_reward_valid": torch.zeros_like(rewards),
+            "intrinsic_done": intrinsic_done.float(),
+            "next_intrinsic_value": next_values,
+        }
+
+    def _assign_segment_intrinsic_reward(
+        self, first_transition, last_transition, env_id=None
+    ):
+        """Write one C-step reward to a segment's final worker transition."""
+        if env_id is None:
+            start_observations = first_transition["obs"]
+            start_goals = first_transition["goal"]
+            start_alive = first_transition["alive"]
+            end_observations = last_transition["next_obs"]
+            end_alive = last_transition["next_alive"]
+        else:
+            start_observations = first_transition["obs"]
+            start_goals = first_transition["goal"]
+            start_alive = first_transition["alive"]
+            end_observations = last_transition["next_obs"][env_id]
+            end_alive = last_transition["next_alive"][env_id]
+
+        rewards, valid = self._compute_intrinsic_rewards(
+            start_observations,
+            end_observations,
+            start_goals,
+            start_alive,
+            end_alive,
+        )
+        if env_id is None:
+            last_transition["intrinsic_reward"] = rewards.detach().clone()
+            last_transition["intrinsic_reward_valid"] = valid.float().detach().clone()
+        else:
+            last_transition["intrinsic_reward"][env_id] = rewards.detach()
+            last_transition["intrinsic_reward_valid"][env_id] = valid.float().detach()
+
+    def _manager_bootstrap(self, next_states, hidden, done):
+        """Peek at next-step values without advancing the live recurrent state."""
+        with torch.no_grad():
+            _, values, _ = self.manager(
+                next_states.reshape(1, -1, self.global_state_dim),
+                self._detach_hidden(hidden),
+            )
+            return values[0].masked_fill(done.reshape(-1) > 0.5, 0.0)
+
+    def _evaluate_manager(self, global_states, done, initial_hidden):
+        """Replay [T, E, state_dim] with the same per-step resets as sampling."""
+        hidden = self._detach_hidden(initial_hidden)
+        goals = []
+        values = []
+        for step in range(len(global_states)):
+            step_goals, step_values, hidden = self.manager(
+                global_states[step].unsqueeze(0), hidden
+            )
+            goals.append(step_goals[0])
+            values.append(step_values[0])
+            keep = (1.0 - done[step]).reshape(1, -1, 1)
+            hidden = (hidden[0] * keep, hidden[1] * keep)
+        return torch.stack(goals), torch.stack(values), hidden
+
     def _store_transition(
         self,
         cache,
         external_reward,
         done,
+        next_global_state,
+        next_local_state,
+        next_alive,
     ):
         transition = {
             "obs": cache["obs"].detach().clone(),
@@ -152,13 +315,29 @@ class Algorithm(BaseAlgorithm):
             "actions": cache["actions"].detach().clone(),
             "old_log_probs": cache["old_log_probs"].detach().clone(),
             "old_value": cache["old_value"].detach().clone(),
+            "old_intrinsic_value": cache["old_intrinsic_value"].detach().clone(),
+            "goal_remaining": cache["goal_remaining"].detach().clone(),
+            "next_value": self._manager_bootstrap(
+                next_global_state,
+                self.manager_hidden,
+                torch.tensor([done], device=self.device),
+            )[0],
             "external_reward": torch.tensor(
                 external_reward, dtype=torch.float32, device=self.device
             ),
             "done": bool(done),
             "alive": cache["alive"].detach().clone(),
             "available_actions": cache["available_actions"].detach().clone(),
+            "next_obs": next_local_state.detach().clone(),
+            "next_alive": next_alive.detach().clone(),
         }
+        transition.update(self._intrinsic_transition(
+            cache,
+            next_global_state,
+            next_local_state,
+            next_alive,
+            torch.tensor(float(done), device=self.device),
+        ))
         self.manager_buffer.append(transition)
         self.worker_buffer.append(transition)
 
@@ -216,24 +395,17 @@ class Algorithm(BaseAlgorithm):
         rewards,
         old_values,
         done,
-        next_global_state,
+        bootstrap_value,
     ):
+        """GAE over time for team [T, E] or individual [T, E, N] signals."""
         with torch.no_grad():
-            if done[-1]:
-                bootstrap_value = torch.tensor(0.0, device=self.device)
-            else:
-                next_state = torch.as_tensor(
-                    next_global_state, dtype=torch.float32, device=self.device
-                ).reshape(1, -1)
-                bootstrap_value = self.critic(next_state)[0]
-
             next_values = torch.empty_like(old_values)
             next_values[:-1] = old_values[1:]
             next_values[-1] = bootstrap_value
 
             deltas = rewards + self.gamma * (1.0 - done) * next_values - old_values
             advantages = torch.zeros_like(deltas)
-            running_gae = torch.tensor(0.0, device=self.device)
+            running_gae = torch.zeros_like(old_values[-1])
             for step in reversed(range(len(rewards))):
                 running_gae = deltas[step] + (
                     self.gamma
@@ -245,6 +417,88 @@ class Algorithm(BaseAlgorithm):
             returns = advantages + old_values
         return advantages, returns
 
+    def _intrinsic_rollout(self, alive):
+        rewards = torch.stack([item["intrinsic_reward"] for item in self.worker_buffer])
+        reward_valid = torch.stack(
+            [item["intrinsic_reward_valid"] for item in self.worker_buffer]
+        )
+        old_values = torch.stack([item["old_intrinsic_value"] for item in self.worker_buffer])
+        done = torch.stack([item["intrinsic_done"] for item in self.worker_buffer])
+        remaining = torch.stack([item["goal_remaining"] for item in self.worker_buffer])
+        advantages, returns = self._compute_advantages(
+            rewards, old_values, done, self.worker_buffer[-1]["next_intrinsic_value"]
+        )
+        sample_dims = tuple(range(rewards.ndim - 1))
+        valid = reward_valid * alive
+        per_agent = (rewards * valid).sum(dim=sample_dims) / valid.sum(
+            dim=sample_dims
+        ).clamp_min(1.0)
+        self.last_per_agent_intrinsic_reward = per_agent.cpu().tolist()
+        self.last_worker_mean_intrinsic_reward = float(
+            ((rewards * valid).sum() / valid.sum().clamp_min(1.0)).item()
+        )
+        return remaining, old_values, advantages, returns
+
+    def _mixed_worker_advantage(self, external_advantage, intrinsic_advantage, active):
+        mixed = external_advantage + self.intrinsic_coef * intrinsic_advantage
+        valid = mixed[active > 0]
+        return (mixed - valid.mean()) / (valid.std(unbiased=False) + 1e-5)
+
+    def _record_worker_advantage_means(
+        self, external_advantages, intrinsic_advantages, alive
+    ):
+        """Record raw GAE means for the advantage chart before actor normalization."""
+        with torch.no_grad():
+            # The trainer groups these fixed rollout values by the episode that
+            # produced each environment transition, rather than averaging whole
+            # rollouts that can contain many unrelated episodes.
+            self.last_external_advantages = external_advantages.detach().clone()
+            self.last_intrinsic_advantages = intrinsic_advantages.detach().clone()
+            self.last_advantage_alive_masks = alive.detach().clone()
+            self.last_worker_mean_external_advantage = float(
+                external_advantages.mean().item()
+            )
+            active_count = alive.sum().clamp_min(1.0)
+            self.last_worker_mean_intrinsic_advantage = float(
+                ((intrinsic_advantages * alive).sum() / active_count).item()
+            )
+            external_per_worker = external_advantages.unsqueeze(-1).expand_as(
+                intrinsic_advantages
+            )
+            external_magnitude = (
+                (external_per_worker.abs() * alive).sum() / active_count
+            )
+            intrinsic_magnitude = (
+                (intrinsic_advantages.abs() * alive).sum() / active_count
+            )
+            weighted_intrinsic_magnitude = self.intrinsic_coef * intrinsic_magnitude
+            self.last_worker_mean_abs_external_advantage = float(
+                external_magnitude.item()
+            )
+            self.last_worker_mean_abs_intrinsic_advantage = float(
+                intrinsic_magnitude.item()
+            )
+            self.last_worker_mean_abs_weighted_intrinsic_advantage = float(
+                weighted_intrinsic_magnitude.item()
+            )
+            self.last_worker_raw_intrinsic_to_external_advantage_ratio = float(
+                (intrinsic_magnitude / external_magnitude.clamp_min(1e-8)).item()
+            )
+            self.last_worker_intrinsic_to_external_advantage_ratio = float(
+                (weighted_intrinsic_magnitude / external_magnitude.clamp_min(1e-8)).item()
+            )
+
+    def _worker_ppo_surrogate(self, importance_ratio, advantage):
+        """PPO clipped surrogate for the current worker only, before factor."""
+        clipped_ratio = importance_ratio.clamp(
+            1.0 - self.worker_ratio_clip,
+            1.0 + self.worker_ratio_clip,
+        )
+        return torch.minimum(
+            importance_ratio * advantage,
+            clipped_ratio * advantage,
+        )
+
     def _train_workers(
         self,
         observations,
@@ -253,6 +507,7 @@ class Algorithm(BaseAlgorithm):
         available_actions,
         old_log_probs,
         advantages,
+        intrinsic_advantages,
         alive,
         done,
     ):
@@ -265,6 +520,7 @@ class Algorithm(BaseAlgorithm):
 
         policy_losses = [0.0] * self.n_agents
         ratios = [1.0] * self.n_agents
+        clip_fractions = [0.0] * self.n_agents
 
         for agent_id in order:
             active = alive[:, agent_id]
@@ -282,11 +538,9 @@ class Algorithm(BaseAlgorithm):
                     done,
                 )
 
-            agent_advantage = advantages.clone()
-            valid_advantage = agent_advantage[active > 0]
-            agent_advantage = (
-                agent_advantage - valid_advantage.mean()
-            ) / (valid_advantage.std(unbiased=False) + 1e-5)
+            agent_advantage = self._mixed_worker_advantage(
+                advantages, intrinsic_advantages[:, agent_id], active
+            )
 
             for _ in range(self.a2c_epoch):
                 log_prob, entropy = self._evaluate_actor(
@@ -300,10 +554,16 @@ class Algorithm(BaseAlgorithm):
                 importance_ratio = torch.exp(
                     log_prob - old_log_probs[:, agent_id]
                 )
+                surrogate = self._worker_ppo_surrogate(
+                    importance_ratio, agent_advantage.detach()
+                )
                 policy_loss = -(
                     factor.detach()
-                    * importance_ratio
-                    * agent_advantage.detach()
+                    * surrogate
+                    * active
+                ).sum() / active_count
+                clip_fraction = (
+                    ((importance_ratio - 1.0).abs() > self.worker_ratio_clip)
                     * active
                 ).sum() / active_count
                 entropy_mean = (entropy * active).sum() / active_count
@@ -333,9 +593,11 @@ class Algorithm(BaseAlgorithm):
                 factor = factor * update_ratio
                 ratios[agent_id] = float(update_ratio[active > 0].mean().item())
                 policy_losses[agent_id] = float(policy_loss.item())
+                clip_fractions[agent_id] = float(clip_fraction.item())
 
         self.last_per_agent_policy_loss = policy_losses
         self.last_per_agent_ratio = ratios
+        self.last_per_agent_ratio_clip_fraction = clip_fractions
         self.last_factor_mean = float(factor.mean().item())
         valid_losses = [
             policy_losses[index]
@@ -346,30 +608,67 @@ class Algorithm(BaseAlgorithm):
             float(np.mean(valid_losses)) if valid_losses else 0.0
         )
 
-    def _train_critic(self, global_states, old_values, returns):
+    def _value_loss_elements(self, values, old_values, returns):
+        original_loss = self._huber_loss(returns.detach() - values)
+        if not self.use_clipped_value_loss:
+            return original_loss
+        clipped_values = old_values.detach() + (values - old_values.detach()).clamp(
+            -self.value_clip, self.value_clip
+        )
+        clipped_loss = self._huber_loss(returns.detach() - clipped_values)
+        return torch.maximum(original_loss, clipped_loss)
+
+    def _train_intrinsic_critics(
+        self, states, observations, goals, remaining, old_values, returns, alive
+    ):
+        losses = [0.0] * self.n_agents
+        remaining_fraction = remaining.to(states.dtype) / self.manager_c_steps
+        for agent_id, critic in enumerate(self.intrinsic_critics):
+            active = alive[..., agent_id]
+            active_count = active.sum()
+            if active_count <= 0:
+                continue
+            for _ in range(self.intrinsic_critic_epoch):
+                values = critic(
+                    states.detach(),
+                    observations[..., agent_id, :].detach(),
+                    goals[..., agent_id, :].detach(),
+                    remaining_fraction,
+                )
+                elements = self._value_loss_elements(
+                    values, old_values[..., agent_id], returns[..., agent_id]
+                )
+                value_loss = (elements * active).sum() / active_count
+                optimizer = self.intrinsic_critic_optimizers[agent_id]
+                optimizer.zero_grad()
+                (self.intrinsic_value_loss_coef * value_loss).backward()
+                nn.utils.clip_grad_norm_(critic.parameters(), self.max_grad_norm)
+                optimizer.step()
+            losses[agent_id] = float(value_loss.item())
+        self.last_per_agent_intrinsic_critic_loss = losses
+        valid_losses = [
+            losses[i] for i in range(self.n_agents) if alive[..., i].sum() > 0
+        ]
+        self.last_intrinsic_critic_loss = float(np.mean(valid_losses)) if valid_losses else 0.0
+
+    def _train_manager_value(
+        self, global_states, old_values, returns, done, initial_hidden
+    ):
+        """Fit the shared manager value head on every worker rollout step."""
         value_loss = torch.tensor(0.0, device=self.device)
         for _ in range(self.critic_epoch):
-            values = self.critic(global_states)
-            original_error = returns.detach() - values
-            original_loss = self._huber_loss(original_error)
-
-            if self.use_clipped_value_loss:
-                clipped_values = old_values + (values - old_values).clamp(
-                    -self.value_clip, self.value_clip
-                )
-                clipped_error = returns.detach() - clipped_values
-                clipped_loss = self._huber_loss(clipped_error)
-                value_loss = torch.maximum(original_loss, clipped_loss).mean()
-            else:
-                value_loss = original_loss.mean()
+            _, values, _ = self._evaluate_manager(
+                global_states, done, initial_hidden
+            )
+            value_loss = self._value_loss_elements(values, old_values, returns).mean()
 
             critic_loss = self.value_loss_coef * value_loss
-            self.critic_optimizer.zero_grad()
+            self.manager_optimizer.zero_grad()
             critic_loss.backward()
             nn.utils.clip_grad_norm_(
-                self.critic.parameters(), self.max_grad_norm
+                self.manager.parameters(), self.max_grad_norm
             )
-            self.critic_optimizer.step()
+            self.manager_optimizer.step()
         self.last_critic_loss = float(value_loss.item())
 
     def _train_manager(
@@ -386,7 +685,7 @@ class Algorithm(BaseAlgorithm):
             self.manager_segment_start_hidden
         )
         goals, manager_values, manager_hidden_after = self.manager(
-            global_states[0].view(1, 1, -1), manager_hidden
+            global_states.unsqueeze(1), manager_hidden
         )
         goal_vectors = goals[0, 0]
         manager_value = manager_values[0, 0]
@@ -475,6 +774,9 @@ class Algorithm(BaseAlgorithm):
         self.parallel_mode = True
         self.parallel_env_count = int(env_count)
         self.parallel_manager_hidden = self.manager.init_hidden(env_count, self.device)
+        self.parallel_manager_rollout_start_hidden = self._detach_hidden(
+            self.parallel_manager_hidden
+        )
         self.parallel_worker_hidden = [
             worker.init_hidden(env_count, self.device) for worker in self.workers
         ]
@@ -526,38 +828,6 @@ class Algorithm(BaseAlgorithm):
             distribution.entropy(),
         )
 
-    def _compute_advantages_parallel(
-        self, rewards, old_values, done, next_global_states
-    ):
-        with torch.no_grad():
-            if next_global_states is None:
-                bootstrap = torch.zeros_like(old_values[-1])
-            else:
-                next_states = torch.as_tensor(
-                    np.asarray(next_global_states, dtype=np.float32),
-                    dtype=torch.float32,
-                    device=self.device,
-                ).reshape(-1, self.global_state_dim)
-                bootstrap = self.critic(next_states)
-                bootstrap = torch.where(
-                    done[-1] > 0.5, torch.zeros_like(bootstrap), bootstrap
-                )
-            next_values = torch.empty_like(old_values)
-            next_values[:-1] = old_values[1:]
-            next_values[-1] = bootstrap
-            deltas = rewards + self.gamma * (1.0 - done) * next_values - old_values
-            advantages = torch.zeros_like(rewards)
-            running_gae = torch.zeros_like(rewards[-1])
-            for step in reversed(range(len(rewards))):
-                running_gae = deltas[step] + (
-                    self.gamma
-                    * self.gae_lambda
-                    * (1.0 - done[step])
-                    * running_gae
-                )
-                advantages[step] = running_gae
-        return advantages, advantages + old_values
-
     def _train_workers_parallel(
         self,
         observations,
@@ -566,6 +836,7 @@ class Algorithm(BaseAlgorithm):
         available_actions,
         old_log_probs,
         advantages,
+        intrinsic_advantages,
         alive,
         done,
     ):
@@ -577,6 +848,7 @@ class Algorithm(BaseAlgorithm):
         )
         losses = [0.0] * self.n_agents
         ratios = [1.0] * self.n_agents
+        clip_fractions = [0.0] * self.n_agents
         for agent_id in order:
             active = alive[:, :, agent_id]
             active_count = active.sum()
@@ -591,9 +863,8 @@ class Algorithm(BaseAlgorithm):
                     available_actions,
                     done,
                 )
-            valid_advantages = advantages[active > 0]
-            agent_advantages = (advantages - valid_advantages.mean()) / (
-                valid_advantages.std(unbiased=False) + 1e-5
+            agent_advantages = self._mixed_worker_advantage(
+                advantages, intrinsic_advantages[:, :, agent_id], active
             )
             for _ in range(self.a2c_epoch):
                 log_prob, entropy = self._evaluate_actor_parallel(
@@ -607,10 +878,16 @@ class Algorithm(BaseAlgorithm):
                 importance_ratio = torch.exp(
                     log_prob - old_log_probs[:, :, agent_id]
                 )
+                surrogate = self._worker_ppo_surrogate(
+                    importance_ratio, agent_advantages.detach()
+                )
                 policy_loss = -(
                     factor.detach()
-                    * importance_ratio
-                    * agent_advantages.detach()
+                    * surrogate
+                    * active
+                ).sum() / active_count
+                clip_fraction = (
+                    ((importance_ratio - 1.0).abs() > self.worker_ratio_clip)
                     * active
                 ).sum() / active_count
                 entropy_mean = (entropy * active).sum() / active_count
@@ -638,9 +915,11 @@ class Algorithm(BaseAlgorithm):
                 factor.mul_(update_ratio)
                 losses[agent_id] = float(policy_loss.item())
                 ratios[agent_id] = float(update_ratio[active > 0].mean().item())
+                clip_fractions[agent_id] = float(clip_fraction.item())
         self.last_sequential_order = order
         self.last_per_agent_policy_loss = losses
         self.last_per_agent_ratio = ratios
+        self.last_per_agent_ratio_clip_fraction = clip_fractions
         self.last_factor_mean = float(factor.mean().item())
         valid_losses = [
             losses[index]
@@ -651,6 +930,7 @@ class Algorithm(BaseAlgorithm):
 
     def _train_manager_segments(self, segments):
         if not segments:
+            self.last_manager_segment_metrics = []
             return None
         losses = []
         cosines = []
@@ -658,9 +938,10 @@ class Algorithm(BaseAlgorithm):
         value_losses = []
         returns = []
         predictions = []
+        segment_metrics = []
         for segment in segments:
             goals, manager_values, hidden_after = self.manager(
-                segment["state"].view(1, 1, -1),
+                torch.stack(segment["states"]).unsqueeze(1),
                 self._detach_hidden(segment["hidden"]),
             )
             goal_vectors = goals[0, 0]
@@ -698,15 +979,21 @@ class Algorithm(BaseAlgorithm):
             value_loss = F.smooth_l1_loss(
                 manager_value, manager_return.detach(), beta=1.0
             )
-            losses.append(
-                -clipped_advantage * cosine
-                + self.manager_value_loss_coef * value_loss
-            )
+            actor_loss = -clipped_advantage * cosine
+            losses.append(actor_loss + self.manager_value_loss_coef * value_loss)
             cosines.append(cosine.detach())
             advantages.append(raw_advantage.detach())
             value_losses.append(value_loss.detach())
             returns.append(manager_return.detach())
             predictions.append(manager_value.detach())
+            segment_metrics.append(
+                {
+                    "env_id": int(segment.get("env_id", -1)),
+                    "segment_steps": len(segment["rewards"]),
+                    "manager_return": float(manager_return.detach().item()),
+                    "manager_actor_loss": float(actor_loss.detach().item()),
+                }
+            )
         manager_loss = torch.stack(losses).mean()
         self.manager_optimizer.zero_grad()
         manager_loss.backward()
@@ -718,11 +1005,12 @@ class Algorithm(BaseAlgorithm):
         self.last_manager_value_loss = float(torch.stack(value_losses).mean().item())
         self.last_manager_return = float(torch.stack(returns).mean().item())
         self.last_manager_value_pred = float(torch.stack(predictions).mean().item())
+        self.last_manager_segment_metrics = segment_metrics
         self.manager_update_count += len(segments)
         self.just_updated = True
         return self.last_loss_manager
 
-    def _train_parallel(self, next_global_state):
+    def _train_parallel(self):
         if not self.worker_buffer:
             return None
         observations = torch.stack([item["obs"] for item in self.worker_buffer])
@@ -741,9 +1029,13 @@ class Algorithm(BaseAlgorithm):
         available = torch.stack(
             [item["available_actions"] for item in self.worker_buffer]
         )
-        advantages, returns = self._compute_advantages_parallel(
-            rewards, old_values, done, next_global_state
+        advantages, returns = self._compute_advantages(
+            rewards, old_values, done, self.worker_buffer[-1]["next_value"]
         )
+        remaining, old_intrinsic_values, intrinsic_advantages, intrinsic_returns = (
+            self._intrinsic_rollout(alive)
+        )
+        self._record_worker_advantage_means(advantages, intrinsic_advantages, alive)
         self._train_workers_parallel(
             observations,
             goals,
@@ -751,24 +1043,32 @@ class Algorithm(BaseAlgorithm):
             available,
             old_log_probs,
             advantages,
+            intrinsic_advantages,
             alive,
             done,
         )
-        time_steps, env_count = rewards.shape
-        batch_size = time_steps * env_count
-        self._train_critic(
-            global_states.reshape(batch_size, self.global_state_dim),
-            old_values.reshape(batch_size).detach(),
-            returns.reshape(batch_size),
+        self._train_manager_value(
+            global_states,
+            old_values.detach(),
+            returns,
+            done,
+            self.parallel_manager_rollout_start_hidden,
+        )
+        self._train_intrinsic_critics(
+            global_states, observations, goals, remaining,
+            old_intrinsic_values, intrinsic_returns, alive,
         )
         self.last_worker_mean_reward = float(rewards.mean().item())
         self.worker_buffer = []
+        self.parallel_manager_rollout_start_hidden = self._detach_hidden(
+            self.parallel_manager_hidden
+        )
         self.parallel_worker_rollout_start_hidden = [
             self._detach_hidden(hidden) for hidden in self.parallel_worker_hidden
         ]
         self.worker_update_count += 1
         self.just_updated = True
-        return self.last_loss_worker + self.last_critic_loss
+        return self.last_loss_worker + self.last_critic_loss + self.last_intrinsic_critic_loss
 
     def train(
         self,
@@ -777,8 +1077,8 @@ class Algorithm(BaseAlgorithm):
         next_alive_mask=None,
     ):
         if self.parallel_mode:
-            return self._train_parallel(next_global_state)
-        del next_local_state, next_alive_mask
+            return self._train_parallel()
+        del next_global_state, next_local_state, next_alive_mask
         if not self.worker_buffer:
             return None
 
@@ -831,9 +1131,12 @@ class Algorithm(BaseAlgorithm):
             external_rewards,
             old_values,
             done,
-            next_global_state,
+            self.worker_buffer[-1]["next_value"],
         )
-
+        remaining, old_intrinsic_values, intrinsic_advantages, intrinsic_returns = (
+            self._intrinsic_rollout(alive)
+        )
+        self._record_worker_advantage_means(advantages, intrinsic_advantages, alive)
         self._train_workers(
             observations,
             goals,
@@ -841,23 +1144,33 @@ class Algorithm(BaseAlgorithm):
             available_actions,
             old_log_probs,
             advantages,
+            intrinsic_advantages,
             alive,
             done,
         )
-        self._train_critic(
-            global_states,
-            old_values.detach(),
-            returns,
+        self._train_manager_value(
+            global_states.unsqueeze(1),
+            old_values.detach().unsqueeze(1),
+            returns.unsqueeze(1),
+            done.unsqueeze(1),
+            self.manager_rollout_start_hidden,
+        )
+        self._train_intrinsic_critics(
+            global_states, observations, goals, remaining,
+            old_intrinsic_values, intrinsic_returns, alive,
         )
 
         self.last_worker_mean_reward = float(external_rewards.mean().item())
         self.worker_buffer = []
+        self.manager_rollout_start_hidden = self._detach_hidden(
+            self.manager_hidden
+        )
         self.worker_rollout_start_hidden = [
             self._detach_hidden(hidden) for hidden in self.worker_hidden
         ]
         self.worker_update_count += 1
         self.just_updated = True
-        return self.last_loss_worker + self.last_critic_loss
+        return self.last_loss_worker + self.last_critic_loss + self.last_intrinsic_critic_loss
 
     def _update_manager(
         self,
@@ -866,6 +1179,10 @@ class Algorithm(BaseAlgorithm):
     ):
         if not self.manager_buffer:
             return None
+
+        self._assign_segment_intrinsic_reward(
+            self.manager_buffer[0], self.manager_buffer[-1]
+        )
 
         global_states = torch.stack(
             [transition["state"] for transition in self.manager_buffer]
@@ -943,6 +1260,9 @@ class Algorithm(BaseAlgorithm):
                 cache,
                 external_reward,
                 done,
+                state,
+                observations,
+                alive,
             )
 
         worker_update_due = (
@@ -952,18 +1272,21 @@ class Algorithm(BaseAlgorithm):
             len(self.manager_buffer) >= self.manager_c_steps
             or (done and self.manager_buffer)
         )
+        if manager_update_due:
+            with torch.enable_grad():
+                self._update_manager(
+                    next_global_state=state,
+                    next_local_state=observations,
+                )
+        # A simultaneous boundary must first write the segment reward into the
+        # shared worker buffer; otherwise its final segment would be omitted
+        # from this worker update.
         if worker_update_due:
             with torch.enable_grad():
                 self.train(
                     next_global_state=state,
                     next_local_state=observations,
                     next_alive_mask=alive,
-                )
-        if manager_update_due:
-            with torch.enable_grad():
-                self._update_manager(
-                    next_global_state=state,
-                    next_local_state=observations,
                 )
 
         if done:
@@ -974,6 +1297,9 @@ class Algorithm(BaseAlgorithm):
             )
 
         if len(self.worker_buffer) == 0:
+            self.manager_rollout_start_hidden = self._detach_hidden(
+                self.manager_hidden
+            )
             self.worker_rollout_start_hidden = [
                 self._detach_hidden(hidden) for hidden in self.worker_hidden
             ]
@@ -983,15 +1309,24 @@ class Algorithm(BaseAlgorithm):
             self.manager_segment_start_hidden = self._detach_hidden(
                 self.manager_hidden
             )
-            with torch.no_grad():
-                goals, _, self.manager_hidden = self.manager(
-                    state.view(1, 1, -1), self.manager_hidden
-                )
+        with torch.no_grad():
+            goals, values, manager_hidden = self.manager(
+                state.view(1, 1, -1), self.manager_hidden
+            )
+            self.manager_hidden = self._detach_hidden(manager_hidden)
+            old_value = values[0, 0]
+        if new_manager_segment:
             self.current_goal = goals[0, 0].detach()
 
+        goal_remaining = torch.tensor(
+            self.manager_c_steps - len(self.manager_buffer), device=self.device
+        )
         actions = []
         log_probs = []
         with torch.no_grad():
+            old_intrinsic_values = self._intrinsic_values(
+                state, observations, self.current_goal, goal_remaining
+            ).masked_fill(alive <= 0, 0.0)
             for agent_id, worker in enumerate(self.workers):
                 logits, new_hidden = worker(
                     observations[agent_id].view(1, 1, -1),
@@ -1009,8 +1344,6 @@ class Algorithm(BaseAlgorithm):
                 actions.append(action)
                 log_probs.append(distribution.log_prob(action))
 
-            old_value = self.critic(state.view(1, -1))[0]
-
         action_tensor = torch.stack(actions)
         old_log_prob_tensor = torch.stack(log_probs)
         self._last_step_cache = {
@@ -1020,6 +1353,8 @@ class Algorithm(BaseAlgorithm):
             "actions": action_tensor,
             "old_log_probs": old_log_prob_tensor,
             "old_value": old_value,
+            "old_intrinsic_value": old_intrinsic_values,
+            "goal_remaining": goal_remaining,
             "alive": alive,
             "available_actions": available,
         }
@@ -1061,40 +1396,46 @@ class Algorithm(BaseAlgorithm):
         elif env_count != self.parallel_env_count:
             raise ValueError("The number of parallel FeUdal environments changed")
 
+        hidden_before = self._detach_hidden(self.parallel_manager_hidden)
+        if not self.worker_buffer:
+            self.parallel_manager_rollout_start_hidden = self._detach_hidden(
+                hidden_before
+            )
+        with torch.no_grad():
+            goals, values, hidden_after = self.manager(
+                states.unsqueeze(0), hidden_before
+            )
+        self.parallel_manager_hidden = self._detach_hidden(hidden_after)
+        old_values = values[0]
+
         due = torch.nonzero(
             self.parallel_goal_remaining <= 0, as_tuple=False
         ).flatten()
         if len(due) > 0:
-            hidden_before = (
-                self.parallel_manager_hidden[0][:, due].detach().clone(),
-                self.parallel_manager_hidden[1][:, due].detach().clone(),
-            )
-            with torch.no_grad():
-                goals, _, hidden_after = self.manager(
-                    states[due].unsqueeze(0), hidden_before
-                )
-            manager_hidden = [part.detach().clone() for part in self.parallel_manager_hidden]
-            manager_hidden[0][:, due] = hidden_after[0]
-            manager_hidden[1][:, due] = hidden_after[1]
-            self.parallel_manager_hidden = tuple(manager_hidden)
-            self.parallel_current_goal[due] = goals[0].detach()
+            self.parallel_current_goal[due] = goals[0, due].detach()
             self.parallel_goal_remaining[due] = self.manager_c_steps
-            for offset, env_id_tensor in enumerate(due):
+            for env_id_tensor in due:
                 env_id = int(env_id_tensor.item())
                 self.parallel_segments[env_id] = {
-                    "state": states[env_id].detach().clone(),
+                    "states": [],
                     "obs": observations[env_id].detach().clone(),
+                    "goal": self.parallel_current_goal[env_id].detach().clone(),
                     "alive": alive[env_id].detach().clone(),
                     "hidden": (
-                        hidden_before[0][:, offset : offset + 1].detach().clone(),
-                        hidden_before[1][:, offset : offset + 1].detach().clone(),
+                        hidden_before[0][:, env_id : env_id + 1].detach().clone(),
+                        hidden_before[1][:, env_id : env_id + 1].detach().clone(),
                     ),
                     "rewards": [],
+                    "worker_transition_indices": [],
                 }
 
         actions = []
         log_probs = []
         with torch.no_grad():
+            old_intrinsic_values = self._intrinsic_values(
+                states, observations, self.parallel_current_goal,
+                self.parallel_goal_remaining,
+            ).masked_fill(alive <= 0, 0.0)
             for agent_id, worker in enumerate(self.workers):
                 logits, hidden = worker(
                     observations[:, agent_id].unsqueeze(0),
@@ -1113,8 +1454,6 @@ class Algorithm(BaseAlgorithm):
                 )
                 actions.append(action)
                 log_probs.append(distribution.log_prob(action))
-            old_values = self.critic(states)
-
         action_tensor = torch.stack(actions, dim=1)
         self._parallel_step_cache = {
             "obs": observations,
@@ -1123,6 +1462,8 @@ class Algorithm(BaseAlgorithm):
             "actions": action_tensor,
             "old_log_probs": torch.stack(log_probs, dim=1),
             "old_value": old_values,
+            "old_intrinsic_value": old_intrinsic_values,
+            "goal_remaining": self.parallel_goal_remaining.detach().clone(),
             "alive": alive,
             "available_actions": available,
         }
@@ -1136,9 +1477,9 @@ class Algorithm(BaseAlgorithm):
         next_local_states=None,
         next_alive_masks=None,
     ):
-        del next_alive_masks
         if self._parallel_step_cache is None:
             raise RuntimeError("sample_actions_batch must be called before storing")
+        self.last_manager_segment_metrics = []
         if next_global_states is None or next_local_states is None:
             raise ValueError("FeUdal parallel rollout requires next states")
         rewards_tensor = torch.as_tensor(
@@ -1162,6 +1503,20 @@ class Algorithm(BaseAlgorithm):
             device=self.device,
         )
         cache = self._parallel_step_cache
+        next_alive = (
+            cache["alive"]
+            if next_alive_masks is None
+            else torch.as_tensor(
+                np.asarray(next_alive_masks, dtype=np.float32),
+                dtype=torch.float32, device=self.device,
+            )
+        )
+        intrinsic_transition = self._intrinsic_transition(
+            cache, next_states, next_observations, next_alive, done_tensor
+        )
+        next_values = self._manager_bootstrap(
+            next_states, self.parallel_manager_hidden, done_tensor
+        )
         self.worker_buffer.append(
             {
                 key: value.detach().clone() for key, value in cache.items()
@@ -1169,18 +1524,36 @@ class Algorithm(BaseAlgorithm):
             | {
                 "external_reward": rewards_tensor.detach().clone(),
                 "done": done_tensor.detach().clone(),
+                "next_value": next_values.detach().clone(),
+                "next_obs": next_observations.detach().clone(),
+                "next_alive": next_alive.detach().clone(),
             }
+            | intrinsic_transition
         )
+        worker_transition_index = len(self.worker_buffer) - 1
         completed_segments = []
         for env_id in range(self.parallel_env_count):
             segment = self.parallel_segments[env_id]
+            segment["states"].append(cache["state"][env_id].detach().clone())
             segment["rewards"].append(rewards_tensor[env_id].detach().clone())
+            segment["worker_transition_indices"].append(worker_transition_index)
             self.parallel_goal_remaining[env_id] -= 1
             terminal = bool(done_tensor[env_id].item() > 0.5)
             if terminal or self.parallel_goal_remaining[env_id] <= 0:
+                final_transition = self.worker_buffer[worker_transition_index]
+                self._assign_segment_intrinsic_reward(
+                    {
+                        "obs": segment["obs"],
+                        "goal": segment["goal"],
+                        "alive": segment["alive"],
+                    },
+                    final_transition,
+                    env_id,
+                )
                 segment["next_state"] = next_states[env_id].detach().clone()
                 segment["next_obs"] = next_observations[env_id].detach().clone()
                 segment["done"] = terminal
+                segment["env_id"] = env_id
                 completed_segments.append(segment)
                 self.parallel_segments[env_id] = None
             if terminal:
@@ -1211,7 +1584,6 @@ class Algorithm(BaseAlgorithm):
         next_local_state=None,
         next_alive_mask=None,
     ):
-        del next_alive_mask
         if not self.parallel_mode:
             if self.worker_buffer:
                 return self.train(next_global_state=next_global_state)
@@ -1230,15 +1602,28 @@ class Algorithm(BaseAlgorithm):
             segments = []
             for env_id, segment in enumerate(self.parallel_segments):
                 if segment is not None and segment["rewards"]:
+                    final_transition = self.worker_buffer[
+                        segment["worker_transition_indices"][-1]
+                    ]
+                    self._assign_segment_intrinsic_reward(
+                        {
+                            "obs": segment["obs"],
+                            "goal": segment["goal"],
+                            "alive": segment["alive"],
+                        },
+                        final_transition,
+                        env_id,
+                    )
                     segment["next_state"] = next_states[env_id].detach().clone()
                     segment["next_obs"] = next_observations[env_id].detach().clone()
                     segment["done"] = False
                     segments.append(segment)
                     self.parallel_segments[env_id] = None
+                    self.parallel_goal_remaining[env_id] = 0
             if segments:
                 self._train_manager_segments(segments)
         if self.worker_buffer:
-            return self._train_parallel(next_global_state)
+            return self._train_parallel()
         return None
 
     def episode_reset(self):
@@ -1251,6 +1636,9 @@ class Algorithm(BaseAlgorithm):
             self.manager_hidden
         )
         if not worker_rollout_pending:
+            self.manager_rollout_start_hidden = self._detach_hidden(
+                self.manager_hidden
+            )
             self.worker_rollout_start_hidden = [
                 self._detach_hidden(hidden) for hidden in self.worker_hidden
             ]
@@ -1264,12 +1652,17 @@ class Algorithm(BaseAlgorithm):
     def save_model(self, checkpoint):
         checkpoint["manager"] = self.manager.state_dict()
         checkpoint["workers"] = self.workers.state_dict()
-        checkpoint["critic"] = self.critic.state_dict()
+        checkpoint["intrinsic_critics"] = self.intrinsic_critics.state_dict()
+        checkpoint["intrinsic_critic_optimizers"] = [
+            optimizer.state_dict() for optimizer in self.intrinsic_critic_optimizers
+        ]
+        # Legacy checkpoints may still contain the removed worker critic.
+        checkpoint.pop("critic", None)
+        checkpoint.pop("critic_optimizer", None)
         checkpoint["manager_optimizer"] = self.manager_optimizer.state_dict()
         checkpoint["worker_optimizers"] = [
             optimizer.state_dict() for optimizer in self.worker_optimizers
         ]
-        checkpoint["critic_optimizer"] = self.critic_optimizer.state_dict()
         checkpoint["worker_update_count"] = self.worker_update_count
         checkpoint["manager_update_count"] = self.manager_update_count
         return checkpoint
@@ -1277,7 +1670,21 @@ class Algorithm(BaseAlgorithm):
     def load_model(self, checkpoint):
         self.manager.load_state_dict(checkpoint["manager"])
         self.workers.load_state_dict(checkpoint["workers"])
-        self.critic.load_state_dict(checkpoint["critic"])
+        if "intrinsic_critics" in checkpoint:
+            self.intrinsic_critics.load_state_dict(checkpoint["intrinsic_critics"])
+            if "intrinsic_critic_optimizers" in checkpoint:
+                states = checkpoint["intrinsic_critic_optimizers"]
+                if len(states) != self.n_agents:
+                    raise ValueError("Intrinsic optimizer count does not match n_agents")
+                for optimizer, state in zip(self.intrinsic_critic_optimizers, states):
+                    optimizer.load_state_dict(state)
+        else:
+            warnings.warn(
+                "Checkpoint has no intrinsic critics; keeping the initialized "
+                "intrinsic critics and optimizers.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         if "manager_optimizer" in checkpoint:
             self.manager_optimizer.load_state_dict(
                 checkpoint["manager_optimizer"]
@@ -1287,10 +1694,6 @@ class Algorithm(BaseAlgorithm):
                 self.worker_optimizers, checkpoint["worker_optimizers"]
             ):
                 optimizer.load_state_dict(state)
-        if "critic_optimizer" in checkpoint:
-            self.critic_optimizer.load_state_dict(
-                checkpoint["critic_optimizer"]
-            )
         self.worker_update_count = int(
             checkpoint.get("worker_update_count", 0)
         )
